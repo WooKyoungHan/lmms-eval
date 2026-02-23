@@ -9,35 +9,91 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+import hashlib
+import os
+from pathlib import Path
+
+_IPB_META_CACHE_DIR = os.environ.get(
+    "IPB_META_CACHE_DIR",
+    os.path.expanduser("~/.cache/ipb_meta")
+)
+
+def _video_fingerprint(path: str) -> str:
+    st = os.stat(path)
+    h = hashlib.sha1()
+    h.update(str(st.st_size).encode())
+    h.update(str(st.st_mtime_ns).encode())
+
+    with open(path, "rb") as f:
+        h.update(f.read(1024 * 1024))
+    return h.hexdigest()
+
+def _meta_cache_path(video_path: str) -> Path:
+    Path(_IPB_META_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+    key = _video_fingerprint(video_path)
+    return Path(_IPB_META_CACHE_DIR) / f"{key}.json"
 
 # -----------------------------
 # ffprobe helpers (no decode)
 # -----------------------------
-def _ffprobe_pict_types_and_pkt_sizes(video_path: str) -> Tuple[List[str], List[int]]:
-    """
-    Display-order 기준 frame별 pict_type(I/P/B/..) + pkt_size(bytes)
-    """
+def _ffprobe_pict_types_and_pkt_sizes(video_path: str):
+    cache_file = _meta_cache_path(video_path)
+
+    # 캐시가 있는데 비어있으면(이전 실패 캐시) 무시하고 재생성
+    if cache_file.exists():
+        data = json.loads(cache_file.read_text())
+        if data.get("ipb") and data.get("sizes"):
+            return data["ipb"], data["sizes"]
+
     cmd = [
         "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
+        "-v", "error",
+        "-select_streams", "v:0",
         "-show_frames",
-        "-show_entries",
-        "frame=pict_type,pkt_size",
-        "-of",
-        "json",
+        "-show_entries", "frame=pkt_size,pict_type",
+        "-of", "csv",
         video_path,
     ]
+
     out = subprocess.check_output(cmd).decode("utf-8", errors="ignore")
-    data = json.loads(out)
-    frames = data.get("frames", [])
 
-    ipb = [fr.get("pict_type", "?") for fr in frames]
-    sizes = [int(fr.get("pkt_size", 0) or 0) for fr in frames]
+    ipb: list[str] = []
+    sizes: list[int] = []
+
+    for line in out.splitlines():
+        # 빈 줄 방지
+        line = line.strip()
+        if not line:
+            continue
+
+        parts = [x.strip() for x in line.split(",")]
+
+        # 최소: frame, <pkt_size>, <pict_field>
+        if len(parts) < 3 or parts[0] != "frame":
+            continue
+
+        pkt = parts[1]
+        pict_field = parts[2]  # "B" / "P" / "I" / "Iside_data" 등
+
+        # pict는 첫 글자만
+        pict = pict_field[:1]
+        if pict not in ("I", "P", "B"):
+            continue
+
+        # pkt_size 숫자 파싱
+        try:
+            size = int(pkt)
+        except ValueError:
+            continue
+
+        ipb.append(pict)
+        sizes.append(size)
+
+    if not ipb:
+        raise RuntimeError("ffprobe parsing produced 0 frames (unexpected).")
+
+    cache_file.write_text(json.dumps({"ipb": ipb, "sizes": sizes}))
     return ipb, sizes
-
 
 def _ffprobe_fps(video_path: str) -> Optional[float]:
     """

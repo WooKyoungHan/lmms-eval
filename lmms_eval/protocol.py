@@ -276,6 +276,7 @@ class ChatMessages(BaseModel):
 
                     if algo == "ipb":
                         cfg = IPBSelectorConfig(fps=req_fps)
+                        print(select_frame_indices_ipb(content.url, cfg))
                         payload["frame_indices"] = select_frame_indices_ipb(content.url, cfg)
 
                     video_input, sampled_fps = fetch_video(
