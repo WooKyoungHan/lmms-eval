@@ -838,5 +838,4 @@ def select_frame_indices_ipb_propfair_gop(
     if len(chosen) > K:
         chosen = sorted(chosen, key=lambda i: float(scores[i]), reverse=True)[:K]
         chosen = sorted(chosen)
-
     return chosen
