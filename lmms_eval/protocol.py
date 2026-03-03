@@ -11,6 +11,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 from lmms_eval.imports import optional_import
+from lmms_eval.models.model_utils.media_encoder import encode_image_to_base64
 
 from lmms_eval.frame_selectors.ipb_selector import (
     IPBSelectorConfig,
