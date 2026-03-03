@@ -4,7 +4,7 @@ import time
 import json
 import atexit
 from io import BytesIO
-from typing import Any, Dict, List, Literal, Union, Optional
+from typing import Any, Dict, List, Literal, Union, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -15,6 +15,7 @@ from lmms_eval.imports import optional_import
 from lmms_eval.frame_selectors.ipb_selector import (
     IPBSelectorConfig,
     select_frame_indices_ipb,
+    select_frame_indices_ipb_propfair_gop,
 )
 
 # Optional video processing dependencies
@@ -23,7 +24,7 @@ cpu, _ = optional_import("decord", "cpu")
 fetch_video, _has_qwen_vl = optional_import("qwen_vl_utils", "fetch_video")
 
 _FRAME_STATS = {"records": []}
-
+_BASE_FPS = 2.0
 
 def _dump_frame_stats():
     path = os.environ.get("LMMS_FRAME_STATS_PATH", "").strip()
@@ -39,7 +40,7 @@ def _dump_frame_stats():
         "mean_frames_used": sum(r["frames_used"] for r in recs) / len(recs),
         "max_frames_used": max(r["frames_used"] for r in recs),
         "min_frames_used": min(r["frames_used"] for r in recs),
-        "algo_on_count": sum(1 for r in recs if r["algo"] == "ipb"),
+        "algo_on_count": sum(1 for r in recs if r["algo"] in {"ipb", "ipb_v2"}),
         "algo_off_count": sum(1 for r in recs if r["algo"] == "default"),
     }
 
@@ -86,13 +87,29 @@ def _resolve_algo(video_kwargs: Dict[str, Any]) -> str:
     v = (video_kwargs or {}).get("frame_selector", None)
     if isinstance(v, str) and v.strip():
         v = v.strip().lower()
-        return "ipb" if v == "ipb" else "default"
+        if v in {"ipb", "ipb_v2"}:
+            return v
+        return "default"
 
     env = os.environ.get("LMMS_USE_ALGO", "").strip().lower()
-    if env in {"ipb", "default"}:
+    if env in {"ipb", "ipb_v2", "default"}:
         return env
     return "default"
 
+def _resolve_budget_ratio(video_kwargs: Dict[str, Any]) -> float:
+    """
+    Priority:
+      1) video_kwargs["budget_ratio"]
+      2) env LMMS_BUDGET_RATIO
+      3) default 1.0
+    """
+    v = _coerce_float((video_kwargs or {}).get("budget_ratio", None))
+    if v is not None:
+        return float(v)
+    env = _coerce_float(os.environ.get("LMMS_BUDGET_RATIO", "").strip() or None)
+    if env is not None:
+        return float(env)
+    return 1.0
 
 def _resolve_fps(video_kwargs: Dict[str, Any]) -> Optional[float]:
     """
@@ -110,6 +127,38 @@ def _resolve_fps(video_kwargs: Dict[str, Any]) -> Optional[float]:
     if env is not None:
         return env
     return None
+
+def _resolve_utility(video_kwargs: Dict[str, Any]) -> str:
+    """
+    Decide IPB utility function for GOP allocator.
+    Priority:
+      1) video_kwargs["utility"] if present
+      2) env LMMS_IPB_UTILITY
+      3) "log"
+    """
+    v = (video_kwargs or {}).get("utility", None)
+    if isinstance(v, str) and v.strip():
+        v = v.strip().lower()
+        if v in {"log", "alpha_fair", "exp"}:
+            return v
+
+    env = os.environ.get("LMMS_IPB_UTILITY", "").strip().lower()
+    if env in {"log", "alpha_fair", "exp"}:
+        return env
+    return "log"
+
+
+def _resolve_alpha_beta(video_kwargs: Dict[str, Any]) -> Tuple[float, float]:
+    """
+    Optional knobs for alpha_fair / exp utilities.
+    Priority:
+      1) video_kwargs["alpha"/"beta"]
+      2) env LMMS_IPB_ALPHA / LMMS_IPB_BETA
+      3) defaults (alpha=2.0, beta=0.5)
+    """
+    alpha = _coerce_float((video_kwargs or {}).get("alpha", None)) or _coerce_float(os.environ.get("LMMS_IPB_ALPHA", "").strip() or None) or 2.0
+    beta = _coerce_float((video_kwargs or {}).get("beta", None)) or _coerce_float(os.environ.get("LMMS_IPB_BETA", "").strip() or None) or 0.5
+    return float(alpha), float(beta)
 
 
 class ChatTextContent(BaseModel):
@@ -202,26 +251,31 @@ class ChatMessages(BaseModel):
                         )
 
                     algo = _resolve_algo(video_kwargs)
-                    req_fps = _resolve_fps(video_kwargs)
+                    # req_fps = _resolve_fps(video_kwargs)
+                    br = _resolve_budget_ratio(video_kwargs)
 
                     payload = {"type": "video", "video": content.url, **video_kwargs}
 
                     # Ensure the resolved fps is actually present in payload if decided from env
-                    if req_fps is not None:
-                        payload["fps"] = req_fps
+                    if algo == "default":
+                        payload["fps"] = float(_BASE_FPS*br)                     # If algo is ipb / ipb_v2, add frame_indices (pre-decode)
+                    elif algo in {"ipb", "ipb_v2"}:
+                        utility = _resolve_utility(video_kwargs)
+                        alpha, beta = _resolve_alpha_beta(video_kwargs)
 
-                    # If algo is ipb, add frame_indices
-                    if algo == "ipb":
-                        cfg = IPBSelectorConfig(fps=req_fps)
-                        payload["frame_indices"] = select_frame_indices_ipb(content.url, cfg)
-
+                        # cfg = IPBSelectorConfig(fps=req_fps, utility=utility, alpha=alpha, beta=beta)
+                        cfg = IPBSelectorConfig(fps=float(_BASE_FPS), budget_ratio=br, utility=utility, alpha=alpha, beta=beta)
+                        if algo == "ipb":
+                            payload["frame_indices"] = select_frame_indices_ipb(content.url, cfg)
+                        else:
+                            payload["frame_indices"] = select_frame_indices_ipb_propfair_gop(content.url, cfg)
                     video_input = fetch_video(payload)
 
                     frames_used = int(video_input.shape[0]) if hasattr(video_input, "shape") else len(video_input)
                     _record_frames_used(
                         video_path=content.url,
                         algo=algo,
-                        fps=req_fps if req_fps is not None else -1.0,
+                        fps=float(_BASE_FPS*br) if float(_BASE_FPS*br) is not None else -1.0,
                         frames_used=frames_used,
                     )
 
@@ -268,17 +322,23 @@ class ChatMessages(BaseModel):
                         )
 
                     algo = _resolve_algo(video_kwargs)
-                    req_fps = _resolve_fps(video_kwargs)
+                    # req_fps = _resolve_fps(video_kwargs)
+                    br = _resolve_budget_ratio(video_kwargs)
 
                     payload = {"type": "video", "video": content.url, **video_kwargs}
-                    if req_fps is not None:
-                        payload["fps"] = req_fps
 
-                    if algo == "ipb":
-                        cfg = IPBSelectorConfig(fps=req_fps)
-                        print(select_frame_indices_ipb(content.url, cfg))
-                        payload["frame_indices"] = select_frame_indices_ipb(content.url, cfg)
+                    # Ensure the resolved fps is actually present in payload if decided from env
+                    if algo == "default":
+                        payload["fps"] = float(_BASE_FPS*br)   
 
+                    elif algo in {"ipb", "ipb_v2"}:
+                        utility = _resolve_utility(video_kwargs)
+                        alpha, beta = _resolve_alpha_beta(video_kwargs)
+                        cfg = IPBSelectorConfig(fps=float(_BASE_FPS), utility=utility, alpha=alpha, beta=beta)
+                        if algo == "ipb":
+                            payload["frame_indices"] = select_frame_indices_ipb(content.url, cfg)
+                        else:
+                            payload["frame_indices"] = select_frame_indices_ipb_propfair_gop(content.url, cfg)
                     video_input, sampled_fps = fetch_video(
                         payload,
                         return_video_metadata=True,
@@ -289,7 +349,7 @@ class ChatMessages(BaseModel):
                     frames_used = int(frames.shape[0])
 
                     # Prefer requested fps if set; else metadata fps (actual)
-                    fps_for_log = req_fps if req_fps is not None else float(video_metadata.get("fps", -1.0))
+                    fps_for_log = float(_BASE_FPS*br) if float(_BASE_FPS*br) is not None else float(video_metadata.get("fps", -1.0))
                     _record_frames_used(
                         video_path=content.url,
                         algo=algo,

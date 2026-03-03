@@ -13,6 +13,8 @@ import hashlib
 import os
 from pathlib import Path
 
+import heapq
+
 _IPB_META_CACHE_DIR = os.environ.get(
     "IPB_META_CACHE_DIR",
     os.path.expanduser("~/.cache/ipb_meta")
@@ -156,13 +158,16 @@ def _get_ipb_indices(ipb_code: torch.Tensor) -> Tuple[List[int], List[int], List
 # -----------------------------
 # policy knobs
 # -----------------------------
+# @dataclass(frozen=True)
 @dataclass(frozen=True)
 class IPBSelectorConfig:
     # budget control
-    fps: Optional[float] = None          # e.g., 0.5, 0.25
-    num_frm_cap: int = 10000               # absolute upper bound
+    fps: Optional[float] = None
+    budget_ratio: float = 1.0
+    max_budget: int = 2048
+    num_frm_cap: int = 10000
 
-    # adaptive policy (from model_utils.py) :contentReference[oaicite:3]{index=3}
+    # adaptive policy (existing)
     beta_cov: float = 0.6
     seg_sec: float = 2.0
     nms_radius_sec: float = 0.25
@@ -170,25 +175,55 @@ class IPBSelectorConfig:
     include_all_I: bool = True
 
     # scoring
-    mode_global: str = "bytes"           # "bytes" or "typed_bytes"
+    mode_global: str = "bytes"
     type_weights: Optional[Dict[str, float]] = None
     priority_for_cov_rep: Sequence[str] = ("P", "B", "I")
 
     # fallback FPS if probing fails
     fallback_src_fps: float = 30.0
 
+    # new: GOP proportional-fair allocator
+    propfair_min_per_gop_if_possible: bool = True
 
+    # 
+    utility: str = "log"
+    alpha: float = 2.0
+    beta: float = 0.5
 # -----------------------------
 # core helpers (index-only)
 # -----------------------------
-def _compute_budget_K(T: int, src_fps: float, target_fps: Optional[float], num_frm_cap: int) -> int:
-    # model_utils의 K 계산 로직을 index-only로 복제 :contentReference[oaicite:4]{index=4}
+def _compute_budget_K(
+    T: int,
+    src_fps: float,
+    target_fps: Optional[float],
+    budget_ratio: float,
+    max_budget: int,
+    num_frm_cap: int,
+) -> int:
+    """
+    Budget rule:
+        base_budget = max(duration_sec * target_fps, max_budget)
+        K = round(base_budget * budget_ratio)
+
+    - budget_ratio must be in [0, 1]
+    - if target_fps is None / invalid, base_budget := max_budget
+    - final hard cap: K <= T and K <= num_frm_cap
+    """
     if T <= 0:
         return 0
-    if target_fps is None or target_fps <= 0 or src_fps <= 0:
-        return min(T, int(num_frm_cap))
-    duration = T / float(src_fps)
-    K = int(round(duration * float(target_fps)))
+
+    br = float(budget_ratio)
+    if br < 0.0 or br > 1.0:
+        raise ValueError(f"budget_ratio must be in [0, 1], got {budget_ratio}")
+    if br == 0.0:
+        return 0
+
+    base_budget = float(max_budget)
+    if target_fps is not None and target_fps > 0 and src_fps > 0:
+        duration_sec = T / float(src_fps)
+        base_budget = min(duration_sec * float(target_fps), float(max_budget))
+
+    K = int(round(base_budget * br))
     K = max(1, K)
     return min(T, K, int(num_frm_cap))
 
@@ -299,7 +334,14 @@ def select_frame_indices_ipb(
     if src_fps is None or src_fps <= 0:
         src_fps = float(cfg.fallback_src_fps)
 
-    K = _compute_budget_K(T, float(src_fps), cfg.fps, int(cfg.num_frm_cap))
+    K = _compute_budget_K(
+        T,
+        float(src_fps),
+        cfg.fps,
+        float(cfg.budget_ratio),
+        int(cfg.max_budget),
+        int(cfg.num_frm_cap),
+    )
     if K <= 0:
         return []
 
@@ -408,3 +450,393 @@ def select_frame_indices_ipb(
 # Convenience: minimal constructor for your common use
 def build_default_cfg(fps: Optional[float]) -> IPBSelectorConfig:
     return IPBSelectorConfig(fps=fps)
+
+
+def _build_frame_scores(
+    *,
+    ipb_code: torch.Tensor,
+    frame_bytes: torch.Tensor,
+    mode_global: str,
+    type_weights: Optional[Dict[str, float]],
+) -> torch.Tensor:
+    fb = frame_bytes.to(torch.float32)
+
+    if mode_global == "bytes":
+        return fb
+
+    if mode_global == "typed_bytes":
+        w = type_weights or {"I": 1.0, "P": 1.0, "B": 1.0}
+        scores = torch.zeros((len(ipb_code),), dtype=torch.float32)
+        for i in range(len(ipb_code)):
+            c = int(ipb_code[i].item())
+            if c == 1:
+                typ = "I"
+            elif c == 0:
+                typ = "P"
+            elif c == -1:
+                typ = "B"
+            else:
+                typ = "P"
+            scores[i] = fb[i] * float(w.get(typ, 1.0))
+        return scores
+
+    raise ValueError(f"Unknown mode_global: {mode_global}")
+
+
+def _build_gop_ranges_from_I(ipb_code: torch.Tensor) -> List[Tuple[int, int]]:
+    """
+    GOP 정의: I부터 다음 I 직전까지.
+    frame 0이 I가 아니어도 [0, first_I) prefix를 하나의 segment로 처리.
+    """
+    T = int(ipb_code.numel())
+    if T <= 0:
+        return []
+
+    starts = [0]
+    for i in range(1, T):
+        if int(ipb_code[i].item()) == 1:  # I-frame
+            starts.append(i)
+
+    gops: List[Tuple[int, int]] = []
+    for j, a in enumerate(starts):
+        b = starts[j + 1] if (j + 1) < len(starts) else T
+        if b > a:
+            gops.append((a, b))
+    return gops
+
+
+def _compute_gop_propfair_weights(
+    gops: Sequence[Tuple[int, int]],
+    frame_scores: torch.Tensor,
+) -> torch.Tensor:
+    """
+    1) 가장 기본형: proportional-fair utility
+       u_i(b_i) = w_i * log(1 + b_i)
+
+    여기서 w_i는 GOP 내부 frame-level score의 평균으로 둔다.
+    mode_global="bytes"면 w_i = mean(pkt_size) = S_i / L_i.
+    (fps가 GOP마다 동일하므로 S_i/T_i와 비례)
+    """
+    if not gops:
+        return torch.zeros((0,), dtype=torch.float32)
+
+    w = torch.zeros((len(gops),), dtype=torch.float32)
+    for gi, (a, b) in enumerate(gops):
+        seg = frame_scores[a:b]
+        if seg.numel() <= 0:
+            w[gi] = 1e-6
+        else:
+            w[gi] = max(float(seg.mean().item()), 1e-6)
+    return w
+
+
+def _allocate_gop_budgets_propfair(
+    weights: torch.Tensor,
+    caps: Sequence[int],
+    K: int,
+    *,
+    min_per_gop_if_possible: bool,
+    utility: str = "log",   # "log" | "alpha_fair" | "exp"
+    alpha: float = 2.0,            # for alpha_fair (>=1, 1이면 log)
+    beta: float = 0.5,             # for exp
+) -> List[int]:
+    """
+    Discrete proportional-fair allocation:
+        maximize sum_i w_i * log(1 + b_i)
+        s.t. sum_i b_i = K, 0 <= b_i <= cap_i, b_i integer
+
+    separable concave integer allocation이므로,
+    marginal gain greedy로 푸는 형태.
+    """
+    G = int(weights.numel())
+    if G <= 0 or K <= 0:
+        return [0] * G
+
+    w = weights.detach().cpu().tolist()
+    b = [0] * G
+    remaining = int(K)
+
+    # 가능하면 GOP당 1장 floor를 먼저 깐다 (coverage 쪽)
+    if min_per_gop_if_possible and K >= G:
+        for i in range(G):
+            if caps[i] > 0:
+                b[i] = 1
+                remaining -= 1
+
+    for _ in range(max(0, remaining)):
+        best_i = -1
+        best_delta = -1.0
+
+        for i in range(G):
+            if b[i] >= caps[i]:
+                continue
+
+            # u_i(b_i+1) - u_i(b_i)
+            if utility == "log":
+                delta = w[i] * (math.log1p(b[i] + 1) - math.log1p(b[i]))
+
+            elif utility == "alpha_fair":
+                if abs(alpha - 1.0) < 1e-9:
+                    delta = w[i] * (math.log1p(b[i] + 1) - math.log1p(b[i]))
+                else:
+                    delta = w[i] * ((b[i] + 2) ** (1 - alpha) - (b[i] + 1) ** (1 - alpha))
+
+            elif utility == "exp":
+                delta = w[i] * (math.exp(-beta * b[i]) - math.exp(-beta * (b[i] + 1)))
+
+            else:
+                raise ValueError(f"unknown utility: {utility}")
+            if delta > best_delta:
+                best_delta = delta
+                best_i = i
+
+        if best_i < 0:
+            break
+        b[best_i] += 1
+
+    return b
+
+
+
+def _delta(utility: str, w: float, b: int, alpha: float, beta: float) -> float:
+    if utility == "log":
+        return w * (math.log1p(b + 1) - math.log1p(b))
+    if utility == "alpha_fair":
+        if abs(alpha - 1.0) < 1e-9:
+            return w * (math.log1p(b + 1) - math.log1p(b))
+        return w * ((b + 2) ** (1 - alpha) - (b + 1) ** (1 - alpha))
+    if utility == "exp":
+        return w * (math.exp(-beta * b) - math.exp(-beta * (b + 1)))
+    raise ValueError(f"unknown utility: {utility}")
+
+def _allocate_gop_budgets_heap(
+    weights: torch.Tensor,
+    caps: Sequence[int],
+    K: int,
+    *,
+    min_per_gop_if_possible: bool,
+    utility: str = "log",
+    alpha: float = 2.0,
+    beta: float = 0.5,
+) -> List[int]:
+    G = int(weights.numel())
+    if G <= 0 or K <= 0:
+        return [0] * G
+
+    w = weights.detach().cpu().tolist()
+    b = [0] * G
+    remaining = int(K)
+
+    # 1) optional floor
+    if min_per_gop_if_possible and K >= G:
+        for i in range(G):
+            if caps[i] > 0:
+                b[i] = 1
+                remaining -= 1
+
+    # 2) heap init with current deltas
+    heap = []
+    for i in range(G):
+        if b[i] < caps[i]:
+            d = _delta(utility, w[i], b[i], alpha, beta)
+            # max-heap via negative
+            heapq.heappush(heap, (-d, i))
+
+    # 3) greedy K steps, update only chosen i
+    while remaining > 0 and heap:
+        negd, i = heapq.heappop(heap)
+        if b[i] >= caps[i]:
+            continue  # stale
+        # apply one unit
+        b[i] += 1
+        remaining -= 1
+
+        # push updated delta for same i
+        if b[i] < caps[i]:
+            d = _delta(utility, w[i], b[i], alpha, beta)
+            heapq.heappush(heap, (-d, i))
+
+    return b
+
+def _pick_topk_in_segment(
+    *,
+    a: int,
+    b: int,
+    k: int,
+    scores: torch.Tensor,
+    frame_bytes: torch.Tensor,
+    ipb_code: torch.Tensor,
+    src_fps: float,
+    nms_radius_sec: float,
+) -> List[int]:
+    """
+    segment [a, b) 안에서 실제 frame idx를 선택한다.
+
+    - k == 1:
+        I-frame만 선택 (GOP 내 I가 없으면 score 기준 top-1 fallback)
+    - k >= 2:
+        GOP 내부에서 P -> B -> I 순서로,
+        각 타입 내부는 pkt_size(frame_bytes) 내림차순으로 선택
+    """
+    if k <= 0 or b <= a:
+        return []
+
+    candidates = list(range(a, b))
+    k = min(k, len(candidates))
+
+    if k == 1:
+        i_idx = [i for i in candidates if int(ipb_code[i].item()) == 1]
+        if len(i_idx) > 0:
+            # I-frame only: choose the largest packet among I-frames in this GOP
+            best = max(i_idx, key=lambda i: int(frame_bytes[i].item()))
+            return [best]
+        # Fallback: if this segment has no I-frame (e.g., prefix before first I), use score top-1
+        best = max(candidates, key=lambda i: float(scores[i]))
+        return [best]
+
+    if k >= 2:
+        p_idx = [i for i in candidates if int(ipb_code[i].item()) == 0]
+        b_idx = [i for i in candidates if int(ipb_code[i].item()) == -1]
+        i_idx = [i for i in candidates if int(ipb_code[i].item()) == 1]
+
+        p_sorted = sorted(p_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
+        b_sorted = sorted(b_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
+        i_sorted = sorted(i_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
+
+        ordered = i_sorted +p_sorted + b_sorted 
+        return sorted(ordered[:k])
+
+    picked = _temporal_nms_pick(
+        candidates,
+        scores,
+        k,
+        src_fps=float(src_fps),
+        nms_radius_sec=float(nms_radius_sec),
+        already_selected=None,
+    )
+
+    if len(picked) < k:
+        used = set(picked)
+        leftovers = sorted(
+            [i for i in candidates if i not in used],
+            key=lambda i: float(scores[i]),
+            reverse=True,
+        )
+        picked.extend(leftovers[: (k - len(picked))])
+
+    return sorted(picked)
+
+def _choose_L_min(gops, src_fps, q=5.0, t_min_sec=0.4, hard_cap=None):
+    lens = np.array([b-a for (a,b) in gops], dtype=np.int32)
+    if lens.size == 0:
+        return 0
+
+    Lq = int(np.percentile(lens, q))
+    Lt = int(np.floor(float(src_fps) * float(t_min_sec)))
+
+    L_min = max(Lq, Lt)
+
+    # 너무 커져서 과도 삭제 방지용 (선택)
+    if hard_cap is not None:
+        L_min = min(L_min, int(hard_cap))
+
+    return max(1, L_min)
+
+def select_frame_indices_ipb_propfair_gop(
+    video_path: str,
+    cfg: IPBSelectorConfig,
+) -> List[int]:
+    """
+    GOP 단위 proportional-fair allocation:
+      1) ffprobe로 pict_type + pkt_size만 읽음
+      2) I 기준으로 GOP 분할
+      3) GOP별 utility: u_i(b_i) = w_i * log(1 + b_i)
+      4) greedy marginal gain으로 GOP budget b_i 배정
+      5) 각 GOP 내부에서 score top-k (with temporal NMS)로 실제 idx 선택
+
+    주의:
+      - 이 첫 버전은 include_all_I를 따로 강제하지 않는다.
+      - 즉, budget K 안에서 utility가 알아서 분배한다.
+    """
+    ipb_str, pkt_sizes = _ffprobe_pict_types_and_pkt_sizes(video_path)
+    T = min(len(ipb_str), len(pkt_sizes))
+    if T <= 0:
+        return []
+
+    ipb_code = torch.tensor([_pict_to_code(p) for p in ipb_str[:T]], dtype=torch.int8)
+    frame_bytes = torch.tensor(pkt_sizes[:T], dtype=torch.int64)
+
+    src_fps = _ffprobe_fps(video_path)
+    if src_fps is None or src_fps <= 0:
+        src_fps = float(cfg.fallback_src_fps)
+
+    K = _compute_budget_K(
+        T,
+        float(src_fps),
+        cfg.fps,
+        float(cfg.budget_ratio),
+        int(cfg.max_budget),
+        int(cfg.num_frm_cap),
+    )
+    if K <= 0:
+        return []
+
+    # 기존 mode_global 로직 재사용: bytes / typed_bytes 모두 가능
+    scores = _build_frame_scores(
+        ipb_code=ipb_code,
+        frame_bytes=frame_bytes,
+        mode_global=cfg.mode_global,
+        type_weights=cfg.type_weights,
+    )
+
+    # GOP 분할 (I ~ next I)
+    gops_raw = _build_gop_ranges_from_I(ipb_code)
+    L_min = _choose_L_min(gops_raw, src_fps, q=10.0, t_min_sec=1)
+    gops = [(a,b) for (a,b) in gops_raw if (b-a) >= L_min]
+    if not gops:
+        return []
+
+    # proportional-fair weight: GOP 내부 평균 score
+    weights = _compute_gop_propfair_weights(gops, scores)
+
+    # 각 GOP 최대 수용량 = GOP 길이
+    caps = [b - a for (a, b) in gops]
+
+    # GOP별 frame budget 할당
+    # budgets = _allocate_gop_budgets_propfair
+    budgets = _allocate_gop_budgets_heap(
+        weights, caps, K,
+        utility=cfg.utility,
+        alpha=float(cfg.alpha),
+        beta=float(cfg.beta),
+        min_per_gop_if_possible=cfg.propfair_min_per_gop_if_possible,
+    )
+
+    # GOP 내부 실제 frame idx 선택
+    chosen: List[int] = []
+    for gi, (a, b) in enumerate(gops):
+        k_i = budgets[gi]
+        if k_i <= 0:
+            continue
+
+        picks = _pick_topk_in_segment(
+            a=a,
+            b=b,
+            k=k_i,
+            scores=scores,
+            frame_bytes=frame_bytes,
+            ipb_code=ipb_code,
+            src_fps=float(src_fps),
+            nms_radius_sec=float(cfg.nms_radius_sec),
+        )
+        chosen.extend(picks)
+
+    # 혹시나 중복/오차 방어
+    chosen = sorted(set(chosen))
+
+    # hard cap
+    if len(chosen) > K:
+        chosen = sorted(chosen, key=lambda i: float(scores[i]), reverse=True)[:K]
+        chosen = sorted(chosen)
+
+    return chosen
