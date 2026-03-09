@@ -139,11 +139,11 @@ def _resolve_utility(video_kwargs: Dict[str, Any]) -> str:
     v = (video_kwargs or {}).get("utility", None)
     if isinstance(v, str) and v.strip():
         v = v.strip().lower()
-        if v in {"log", "alpha_fair", "exp"}:
+        if v in {"log", "alpha_fair", "exp","v3"}:
             return v
 
     env = os.environ.get("LMMS_IPB_UTILITY", "").strip().lower()
-    if env in {"log", "alpha_fair", "exp"}:
+    if env in {"log", "alpha_fair", "exp","v3"}:
         return env
     return "log"
 

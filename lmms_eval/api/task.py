@@ -433,32 +433,55 @@ class Task(abc.ABC):
         if cache_requests and (not cached_instances or rewrite_requests_cache) and limit is not None:
             limit = None
 
-        doc_id_docs = utils.create_iterator(
-            enumerate(self.eval_docs_no_media),
-            rank=rank,
-            limit=int(limit) if limit else None,
-            world_size=world_size,
-            offset=offset,
-        )
-        doc_iterator_for_counting = (
-            utils.create_iterator(
-                range(len(self.test_docs())),
-                rank=rank,
-                limit=limit,
-                world_size=world_size,
-                offset=offset,
-            )
-            if self.has_test_docs()
-            else utils.create_iterator(
-                range(len(self.validation_docs())),
-                rank=rank,
-                limit=limit,
-                world_size=world_size,
-                offset=offset,
-            )
-        )
+        # Use the actual no-media doc source selected above.
+        if self.has_test_docs():
+            docs_no_media = self.test_docs_no_media()
+        elif self.has_validation_docs():
+            docs_no_media = self.validation_docs_no_media()
+        else:
+            docs_no_media = docs
 
-        num_docs = sum(1 for _ in doc_iterator_for_counting)
+        selected_indices = getattr(self, "_codec_selected_doc_indices", None)
+
+        if selected_indices is not None:
+            selected_indices = list(selected_indices)
+            selected_doc_ids = utils.create_iterator(
+                selected_indices,
+                rank=rank,
+                limit=int(limit) if limit else None,
+                world_size=world_size,
+                offset=offset,
+            )
+            num_docs = len(selected_indices) if limit is None else min(len(selected_indices), int(limit))
+            doc_id_docs = ((doc_id, docs_no_media[doc_id]) for doc_id in selected_doc_ids)
+        else:
+            doc_id_docs = utils.create_iterator(
+                enumerate(docs_no_media),
+                rank=rank,
+                limit=int(limit) if limit else None,
+                world_size=world_size,
+                offset=offset,
+            )
+
+            doc_iterator_for_counting = (
+                utils.create_iterator(
+                    range(len(self.test_docs())),
+                    rank=rank,
+                    limit=limit,
+                    world_size=world_size,
+                    offset=offset,
+                )
+                if self.has_test_docs()
+                else utils.create_iterator(
+                    range(len(self.validation_docs())),
+                    rank=rank,
+                    limit=limit,
+                    world_size=world_size,
+                    offset=offset,
+                )
+            )
+
+            num_docs = sum(1 for _ in doc_iterator_for_counting)
 
         for doc_id, doc in tqdm(
             doc_id_docs,
@@ -686,6 +709,19 @@ class Task(abc.ABC):
 
     def doc_iterator(self, *, rank: int = 0, limit: Union[int, None] = None, world_size: int = 1, offset: int = 0) -> Iterator[Tuple[int, Any]]:
         limit = int(limit) if limit else None
+        selected_indices = getattr(self, "_codec_selected_doc_indices", None)
+
+        if selected_indices is not None:
+            docs = self.eval_docs
+            selected_doc_ids = utils.create_iterator(
+                list(selected_indices),
+                rank=int(rank),
+                limit=limit,
+                world_size=int(world_size),
+                offset=offset,
+            )
+            return ((doc_id, docs[doc_id]) for doc_id in selected_doc_ids)
+
         doc_iterator = utils.create_iterator(
             enumerate(self.eval_docs),
             rank=int(rank),

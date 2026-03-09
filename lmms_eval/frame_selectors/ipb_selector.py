@@ -4,7 +4,7 @@ import json
 import math
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -14,6 +14,11 @@ import os
 from pathlib import Path
 
 import heapq
+
+try:
+    import av  # type: ignore
+except Exception:
+    av = None
 
 _IPB_META_CACHE_DIR = os.environ.get(
     "IPB_META_CACHE_DIR",
@@ -34,6 +39,11 @@ def _meta_cache_path(video_path: str) -> Path:
     Path(_IPB_META_CACHE_DIR).mkdir(parents=True, exist_ok=True)
     key = _video_fingerprint(video_path)
     return Path(_IPB_META_CACHE_DIR) / f"{key}.json"
+
+def _meta_cache_path_with_suffix(video_path: str, suffix: str) -> Path:
+    Path(_IPB_META_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+    key = _video_fingerprint(video_path)
+    return Path(_IPB_META_CACHE_DIR) / f"{key}_{suffix}.json"
 
 # -----------------------------
 # ffprobe helpers (no decode)
@@ -189,6 +199,17 @@ class IPBSelectorConfig:
     utility: str = "log"
     alpha: float = 2.0
     beta: float = 0.5
+
+    # version 3: motion-aware GOP utility weight
+    # utility_v3 = log(1 + normalized pkt/frame) * (1 - exp(-beta * normalized motion/frame))
+    v3_motion_beta: float = 2.0
+    v3_enable_motion_cache: bool = True
+
+    # suspicious GOP detection is used only to exclude GOPs from the
+    # "minimum 1 frame per GOP" floor allocation.
+    # Default: high pkt/frame + low motion efficiency = suspicious.
+    v3_susp_rate_q: float = 0.85
+    v3_susp_eff_q: float = 0.20
 # -----------------------------
 # core helpers (index-only)
 # -----------------------------
@@ -505,6 +526,218 @@ def _build_gop_ranges_from_I(ipb_code: torch.Tensor) -> List[Tuple[int, int]]:
     return gops
 
 
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _frame_motion_mass_from_rows(rows: Sequence[Sequence[float]]) -> float:
+    total = 0.0
+    for row in rows:
+        if len(row) < 9:
+            continue
+        w = float(row[4])
+        h = float(row[5])
+        scale = float(row[8])
+        if scale == 0.0:
+            scale = 1.0
+        dx = float(row[6]) / scale
+        dy = float(row[7]) / scale
+        total += (w * h) * math.sqrt(dx * dx + dy * dy)
+    return total
+
+
+def _motion_vectors_side_data(frame: Any):
+    side_data = getattr(frame, "side_data", None)
+    if side_data is None:
+        return None
+
+    try:
+        mv_sd = side_data.get("MOTION_VECTORS")
+        if mv_sd is not None:
+            return mv_sd
+    except Exception:
+        pass
+
+    try:
+        for sd in side_data:
+            sd_type = str(getattr(sd, "type", ""))
+            if "MOTION_VECTORS" in sd_type or "Motion vectors" in sd_type:
+                return sd
+    except Exception:
+        pass
+    return None
+
+
+def _extract_frame_motion_masses_pyav(video_path: str, *, use_cache: bool = True) -> List[float]:
+    cache_file = _meta_cache_path_with_suffix(video_path, "motion_mass")
+    if use_cache and cache_file.exists():
+        try:
+            data = json.loads(cache_file.read_text())
+            vals = data.get("motion_mass", [])
+            if vals:
+                return [float(v) for v in vals]
+        except Exception:
+            pass
+
+    if av is None:
+        raise RuntimeError("PyAV is not available; version 3 motion-aware utility requires av.")
+
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+
+    try:
+        stream.codec_context.flags2 |= av.codec.context.Flags2.EXPORT_MVS
+    except Exception:
+        try:
+            stream.codec_context.options = {"flags2": "+export_mvs"}
+        except Exception:
+            pass
+
+    out: List[float] = []
+    for packet in container.demux(stream):
+        for frame in packet.decode():
+            mv_sd = _motion_vectors_side_data(frame)
+            if mv_sd is None:
+                out.append(0.0)
+                continue
+
+            rows = []
+            try:
+                iterator = list(mv_sd)
+            except Exception:
+                iterator = []
+
+            for mv in iterator:
+                rows.append([
+                    float(getattr(mv, "src_x", 0) or 0),
+                    float(getattr(mv, "src_y", 0) or 0),
+                    float(getattr(mv, "dst_x", 0) or 0),
+                    float(getattr(mv, "dst_y", 0) or 0),
+                    float(getattr(mv, "w", 0) or 0),
+                    float(getattr(mv, "h", 0) or 0),
+                    float(getattr(mv, "motion_x", 0) or 0),
+                    float(getattr(mv, "motion_y", 0) or 0),
+                    float(getattr(mv, "motion_scale", 1) or 1),
+                ])
+            out.append(_frame_motion_mass_from_rows(rows))
+
+    container.close()
+
+    if use_cache and out:
+        try:
+            cache_file.write_text(json.dumps({"motion_mass": out}))
+        except Exception:
+            pass
+    return out
+
+
+def _compute_gop_stats_v3(
+    gops: Sequence[Tuple[int, int]],
+    frame_scores: torch.Tensor,
+    frame_motion_mass: Sequence[float],
+    src_fps: float,
+) -> List[Dict[str, float]]:
+    stats: List[Dict[str, float]] = []
+    motion_np = np.asarray(frame_motion_mass, dtype=np.float64)
+    for gi, (a, b) in enumerate(gops):
+        L = max(1, int(b - a))
+        duration = L / max(float(src_fps), 1e-6)
+        pkt_sum = float(frame_scores[a:b].sum().item())
+        pkt_per_frame = pkt_sum / max(float(L), 1e-9)
+        motion_sum = float(motion_np[a:b].sum()) if motion_np.size > 0 else 0.0
+        motion_per_frame = motion_sum / max(float(L), 1e-9)
+        motion_efficiency = motion_per_frame / max(pkt_per_frame, 1e-12)
+        stats.append({
+            "gop_id": float(gi),
+            "start": float(a),
+            "end": float(b),
+            "num_frames": float(L),
+            "duration": float(duration),
+            "pkt_sum": float(pkt_sum),
+            "pkt_per_frame": float(pkt_per_frame),
+            "motion_mass_sum": float(motion_sum),
+            "motion_per_frame": float(motion_per_frame),
+            "motion_efficiency": float(motion_efficiency),
+        })
+    return stats
+
+
+def _compute_gop_propfair_weights_v3(
+    gops: Sequence[Tuple[int, int]],
+    frame_scores: torch.Tensor,
+    frame_motion_mass: Sequence[float],
+    src_fps: float,
+    *,
+    motion_beta: float,
+) -> Tuple[torch.Tensor, List[Dict[str, float]]]:
+    if not gops:
+        return torch.zeros((0,), dtype=torch.float32), []
+
+    stats = _compute_gop_stats_v3(gops, frame_scores, frame_motion_mass, src_fps)
+
+    R = np.asarray([s["pkt_per_frame"] for s in stats], dtype=np.float64)
+    M = np.asarray([s["motion_per_frame"] for s in stats], dtype=np.float64)
+
+    R_ref = float(np.median(R[R > 0])) if np.any(R > 0) else 1.0
+    M_ref = float(np.median(M[M > 0])) if np.any(M > 0) else 1.0
+
+    weights = torch.zeros((len(gops),), dtype=torch.float32)
+    for gi, s in enumerate(stats):
+        Rn = s["pkt_per_frame"] / max(R_ref, 1e-12)
+        Mn = s["motion_per_frame"] / max(M_ref, 1e-12)
+
+        bit_term = math.log1p(Rn)
+        motion_gate = 1.0 - math.exp(-float(motion_beta) * Mn)
+        utility_v3 = bit_term * motion_gate
+
+        s["Rn"] = float(Rn)
+        s["Mn"] = float(Mn)
+        s["bit_term"] = float(bit_term)
+        s["motion_gate"] = float(motion_gate)
+        s["utility_v3"] = float(utility_v3)
+        s["R_ref"] = float(R_ref)
+        s["M_ref"] = float(M_ref)
+        weights[gi] = max(float(utility_v3), 1e-6)
+
+    return weights, stats
+
+
+def _compute_suspicious_gop_mask_v3(
+    stats: Sequence[Dict[str, float]],
+    *,
+    rate_q: float,
+    eff_q: float,
+) -> np.ndarray:
+    """
+    Suspicious GOPs are excluded only from the minimum-per-GOP floor allocation.
+
+    Criterion:
+        high pkt/frame  AND  low motion_efficiency
+    where
+        motion_efficiency = motion_per_frame / max(pkt_per_frame, eps)
+    """
+    if not stats:
+        return np.zeros((0,), dtype=bool)
+
+    rate = np.asarray([float(s.get("pkt_per_frame", 0.0)) for s in stats], dtype=np.float64)
+    eff = np.asarray([float(s.get("motion_efficiency", 0.0)) for s in stats], dtype=np.float64)
+
+    rate_thr = float(np.quantile(rate, rate_q)) if rate.size > 0 else 0.0
+    eff_thr = float(np.quantile(eff, eff_q)) if eff.size > 0 else 0.0
+
+    mask = np.zeros((len(stats),), dtype=bool)
+    for i, s in enumerate(stats):
+        is_suspicious = bool(
+            float(s.get("pkt_per_frame", 0.0)) >= rate_thr
+            and float(s.get("motion_efficiency", 0.0)) <= eff_thr
+        )
+        s["suspicious_rate_thr"] = rate_thr
+        s["suspicious_eff_thr"] = eff_thr
+        s["is_suspicious"] = is_suspicious
+        mask[i] = is_suspicious
+    return mask
+
+
 def _compute_gop_propfair_weights(
     gops: Sequence[Tuple[int, int]],
     frame_scores: torch.Tensor,
@@ -536,6 +769,7 @@ def _allocate_gop_budgets_propfair(
     K: int,
     *,
     min_per_gop_if_possible: bool,
+    min_floor_mask: Optional[Sequence[bool]] = None,
     utility: str = "log",   # "log" | "alpha_fair" | "exp"
     alpha: float = 2.0,            # for alpha_fair (>=1, 1이면 log)
     beta: float = 0.5,             # for exp
@@ -556,10 +790,13 @@ def _allocate_gop_budgets_propfair(
     b = [0] * G
     remaining = int(K)
 
+    floor_mask = [True] * G if min_floor_mask is None else [bool(x) for x in min_floor_mask]
+    n_floor = sum(1 for i in range(G) if floor_mask[i] and caps[i] > 0)
+
     # 가능하면 GOP당 1장 floor를 먼저 깐다 (coverage 쪽)
-    if min_per_gop_if_possible and K >= G:
+    if min_per_gop_if_possible and K >= n_floor:
         for i in range(G):
-            if caps[i] > 0:
+            if floor_mask[i] and caps[i] > 0:
                 b[i] = 1
                 remaining -= 1
 
@@ -615,6 +852,7 @@ def _allocate_gop_budgets_heap(
     K: int,
     *,
     min_per_gop_if_possible: bool,
+    min_floor_mask: Optional[Sequence[bool]] = None,
     utility: str = "log",
     alpha: float = 2.0,
     beta: float = 0.5,
@@ -627,10 +865,13 @@ def _allocate_gop_budgets_heap(
     b = [0] * G
     remaining = int(K)
 
+    floor_mask = [True] * G if min_floor_mask is None else [bool(x) for x in min_floor_mask]
+    n_floor = sum(1 for i in range(G) if floor_mask[i] and caps[i] > 0)
+
     # 1) optional floor
-    if min_per_gop_if_possible and K >= G:
+    if min_per_gop_if_possible and K >= n_floor:
         for i in range(G):
-            if caps[i] > 0:
+            if floor_mask[i] and caps[i] > 0:
                 b[i] = 1
                 remaining -= 1
 
@@ -694,18 +935,25 @@ def _pick_topk_in_segment(
         best = max(candidates, key=lambda i: float(scores[i]))
         return [best]
 
+    # if k >= 2:
+    #     p_idx = [i for i in candidates if int(ipb_code[i].item()) == 0]
+    #     b_idx = [i for i in candidates if int(ipb_code[i].item()) == -1]
+    #     i_idx = [i for i in candidates if int(ipb_code[i].item()) == 1]
+
+    #     p_sorted = sorted(p_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
+    #     b_sorted = sorted(b_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
+    #     i_sorted = sorted(i_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
+
+    #     ordered = i_sorted +p_sorted + b_sorted 
+    #     return sorted(ordered[:k])
     if k >= 2:
-        p_idx = [i for i in candidates if int(ipb_code[i].item()) == 0]
-        b_idx = [i for i in candidates if int(ipb_code[i].item()) == -1]
-        i_idx = [i for i in candidates if int(ipb_code[i].item()) == 1]
+        L = b - a
+        if k >= L:
+            return list(range(a, b))
 
-        p_sorted = sorted(p_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
-        b_sorted = sorted(b_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
-        i_sorted = sorted(i_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
-
-        ordered = i_sorted +p_sorted + b_sorted 
-        return sorted(ordered[:k])
-
+        # uniform sampling (segment midpoints)
+        idx = a + ((np.arange(k) + 0.5) * L / k).astype(int)
+        return idx.tolist()
     picked = _temporal_nms_pick(
         candidates,
         scores,
@@ -796,20 +1044,50 @@ def select_frame_indices_ipb_propfair_gop(
     if not gops:
         return []
 
-    # proportional-fair weight: GOP 내부 평균 score
-    weights = _compute_gop_propfair_weights(gops, scores)
+    gop_debug_stats: Optional[List[Dict[str, float]]] = None
+    alloc_utility = cfg.utility
+
+    # proportional-fair weight
+    if cfg.utility == "v3":
+        frame_motion_mass = _extract_frame_motion_masses_pyav(
+            video_path,
+            use_cache=bool(cfg.v3_enable_motion_cache),
+        )
+        Tm = min(T, len(frame_motion_mass))
+        if Tm < T:
+            frame_motion_mass = list(frame_motion_mass) + [0.0] * (T - Tm)
+        else:
+            frame_motion_mass = list(frame_motion_mass[:T])
+
+        weights, gop_debug_stats = _compute_gop_propfair_weights_v3(
+            gops,
+            scores,
+            frame_motion_mass,
+            float(src_fps),
+            motion_beta=float(cfg.v3_motion_beta),
+        )
+        suspicious_mask = _compute_suspicious_gop_mask_v3(
+            gop_debug_stats,
+            rate_q=float(cfg.v3_susp_rate_q),
+            eff_q=float(cfg.v3_susp_eff_q),
+        )
+        # v3 uses motion-aware weights, then allocates frames with the usual concave kernel.
+        # suspicious GOPs are excluded only from the minimum-per-GOP floor allocation.
+        alloc_utility = "exp"
+    else:
+        weights = _compute_gop_propfair_weights(gops, scores)
 
     # 각 GOP 최대 수용량 = GOP 길이
     caps = [b - a for (a, b) in gops]
 
     # GOP별 frame budget 할당
-    # budgets = _allocate_gop_budgets_propfair
     budgets = _allocate_gop_budgets_heap(
         weights, caps, K,
-        utility=cfg.utility,
+        utility=alloc_utility,
         alpha=float(cfg.alpha),
         beta=float(cfg.beta),
         min_per_gop_if_possible=cfg.propfair_min_per_gop_if_possible,
+        min_floor_mask=None if suspicious_mask is None else (~suspicious_mask).tolist(),
     )
 
     # GOP 내부 실제 frame idx 선택
@@ -839,3 +1117,119 @@ def select_frame_indices_ipb_propfair_gop(
         chosen = sorted(chosen, key=lambda i: float(scores[i]), reverse=True)[:K]
         chosen = sorted(chosen)
     return chosen
+
+def analyze_ipb_propfair_gop(
+    video_path: str,
+    cfg: IPBSelectorConfig,
+) -> Dict[str, Any]:
+    """
+    Notebook/debug helper.
+    Returns GOP-wise stats, weights, budgets, and chosen indices.
+    For utility="v3", GOP stats include the motion-aware terms.
+    """
+    ipb_str, pkt_sizes = _ffprobe_pict_types_and_pkt_sizes(video_path)
+    T = min(len(ipb_str), len(pkt_sizes))
+    if T <= 0:
+        return {
+            "T": 0,
+            "gops": [],
+            "weights": torch.zeros((0,), dtype=torch.float32),
+            "budgets": [],
+            "selected": [],
+            "gop_stats": [],
+        }
+
+    ipb_code = torch.tensor([_pict_to_code(p) for p in ipb_str[:T]], dtype=torch.int8)
+    frame_bytes = torch.tensor(pkt_sizes[:T], dtype=torch.int64)
+    scores = _build_frame_scores(
+        ipb_code=ipb_code,
+        frame_bytes=frame_bytes,
+        mode_global=cfg.mode_global,
+        type_weights=cfg.type_weights,
+    )
+
+    src_fps = _ffprobe_fps(video_path)
+    if src_fps is None or src_fps <= 0:
+        src_fps = float(cfg.fallback_src_fps)
+
+    K = _compute_budget_K(
+        T,
+        float(src_fps),
+        cfg.fps,
+        float(cfg.budget_ratio),
+        int(cfg.max_budget),
+        int(cfg.num_frm_cap),
+    )
+
+    gops_raw = _build_gop_ranges_from_I(ipb_code)
+    L_min = _choose_L_min(gops_raw, src_fps, q=10.0, t_min_sec=1)
+    gops = [(a, b) for (a, b) in gops_raw if (b - a) >= L_min]
+
+    alloc_utility = cfg.utility
+    suspicious_mask: Optional[np.ndarray] = None
+    if cfg.utility == "v3":
+        frame_motion_mass = _extract_frame_motion_masses_pyav(
+            video_path,
+            use_cache=bool(cfg.v3_enable_motion_cache),
+        )
+        Tm = min(T, len(frame_motion_mass))
+        if Tm < T:
+            frame_motion_mass = list(frame_motion_mass) + [0.0] * (T - Tm)
+        else:
+            frame_motion_mass = list(frame_motion_mass[:T])
+        weights, gop_stats = _compute_gop_propfair_weights_v3(
+            gops,
+            scores,
+            frame_motion_mass,
+            float(src_fps),
+            motion_beta=float(cfg.v3_motion_beta),
+        )
+        suspicious_mask = _compute_suspicious_gop_mask_v3(
+            gop_stats,
+            rate_q=float(cfg.v3_susp_rate_q),
+            eff_q=float(cfg.v3_susp_eff_q),
+        )
+        alloc_utility = "exp"
+    else:
+        weights = _compute_gop_propfair_weights(gops, scores)
+        gop_stats = []
+        for gi, (a, b) in enumerate(gops):
+            gop_stats.append({
+                "gop_id": float(gi),
+                "start": float(a),
+                "end": float(b),
+                "num_frames": float(b - a),
+                "weight": float(weights[gi].item()),
+            })
+
+    caps = [b - a for (a, b) in gops]
+    budgets = _allocate_gop_budgets_heap(
+        weights,
+        caps,
+        K,
+        utility=alloc_utility,
+        alpha=float(cfg.alpha),
+        beta=float(cfg.beta),
+        min_per_gop_if_possible=cfg.propfair_min_per_gop_if_possible,
+        min_floor_mask=None if suspicious_mask is None else (~suspicious_mask).tolist(),
+    )
+
+    for gi in range(len(gops)):
+        if gi < len(gop_stats):
+            gop_stats[gi]["weight"] = float(weights[gi].item())
+            gop_stats[gi]["budget"] = int(budgets[gi])
+
+    selected = select_frame_indices_ipb_propfair_gop(video_path, cfg)
+
+    return {
+        "T": T,
+        "src_fps": float(src_fps),
+        "K": int(K),
+        "gops": gops,
+        "weights": weights,
+        "budgets": budgets,
+        "scores": scores,
+        "selected": selected,
+        "gop_stats": gop_stats,
+        "L_min": int(L_min),
+    }

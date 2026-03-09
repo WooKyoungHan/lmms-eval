@@ -47,6 +47,66 @@ from lmms_eval.utils import (
     simple_parse_args_string,
 )
 
+def _get_videomme_bucket(doc, bucket_field="duration"):
+    if isinstance(doc, dict):
+        if bucket_field in doc:
+            return doc[bucket_field]
+
+        md = doc.get("metadata", None)
+        if isinstance(md, dict) and bucket_field in md:
+            return md[bucket_field]
+
+        for k in ("subset", "split", "duration_type", "duration_group"):
+            if k in doc and doc[k] in ("short", "medium", "long"):
+                return doc[k]
+
+    return None
+
+
+def _parse_bucket_counts(s: str):
+    # "short=300,mid=300,long=300"
+    out = {}
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        k, v = part.split("=")
+        out[k.strip()] = int(v.strip())
+    return out
+
+
+def _stratified_pick_indices(docs, limit, bucket_field="duration", counts=None, seed=0):
+    buckets = ("short", "medium", "long")
+
+    if counts is None:
+        base = limit // len(buckets)
+        rem = limit % len(buckets)
+        counts = {b: base for b in buckets}
+        for i in range(rem):
+            counts[buckets[i]] += 1
+
+    idx_by_bucket = {b: [] for b in buckets}
+    for i, doc in enumerate(docs):
+        b = _get_videomme_bucket(doc, bucket_field=bucket_field)
+        if b in idx_by_bucket:
+            idx_by_bucket[b].append(i)
+
+    eval_logger.info(
+        f"[VideoMME stratified limit] bucket_sizes={ {k: len(v) for k, v in idx_by_bucket.items()} }"
+    )
+
+    chosen = []
+    for b in buckets:
+        ids = idx_by_bucket[b]
+        chosen.extend(ids[: min(counts.get(b, 0), len(ids))])
+
+    if len(chosen) < limit:
+        chosen_set = set(chosen)
+        rest = [i for i in range(len(docs)) if i not in chosen_set]
+        chosen.extend(rest[: (limit - len(chosen))])
+
+    return chosen[:limit]
+
 
 @positional_deprecated
 def simple_evaluate(
@@ -485,7 +545,7 @@ def evaluate(
         lm.accelerator = Accelerator()
 
     for task_output in eval_tasks:
-        task: Task = task_output.task
+        task = task_output.task
         task_name = task_output.task_name
         task.args = cli_args
 
@@ -517,10 +577,77 @@ def evaluate(
         if ("group_alias" in configs[task_name]) and (group_name not in task_group_alias) and (group_name is not None):
             task_group_alias[group_name] = configs[task_name]["group_alias"]
 
-        limit = get_sample_size(task, limit)
+        task_limit = limit
+        task_offset = offset
+        task._codec_selected_doc_indices = None
+
+        # --------------------------------------------------
+        # VideoMME-only stratified limiting (counts mode only)
+        # --------------------------------------------------
+        strat = os.environ.get("LMMS_LIMIT_STRAT", "").strip().lower()
+
+        if strat == "counts" and "videomme" in task_name.lower():
+            bucket_field = os.environ.get("LMMS_LIMIT_BUCKET_FIELD", "duration").strip()
+            seed = int(os.environ.get("LMMS_LIMIT_SEED", "0"))
+
+            # Always materialize from the actual task doc source used by request building
+            try:
+                if task.has_test_docs():
+                    docs = list(task.test_docs())
+                    source_kind = "test"
+                else:
+                    docs = list(task.validation_docs())
+                    source_kind = "validation"
+            except Exception:
+                docs = None
+                source_kind = None
+
+            if docs is not None and task_limit is not None:
+                if isinstance(task_limit, float) and task_limit < 1:
+                    lim_int = max(1, int(len(docs) * task_limit))
+                else:
+                    lim_int = min(int(task_limit), len(docs))
+
+                counts = _parse_bucket_counts(os.environ["LMMS_LIMIT_BUCKET_COUNTS"])
+                if sum(counts.values()) != lim_int:
+                    raise ValueError(
+                        f"Sum of LMMS_LIMIT_BUCKET_COUNTS ({sum(counts.values())}) != limit ({lim_int})"
+                    )
+
+                bucket_preview = [
+                    _get_videomme_bucket(doc, bucket_field=bucket_field)
+                    for doc in docs[:20]
+                ]
+                eval_logger.info(
+                    f"[VideoMME stratified limit] bucket_field={bucket_field}, first20_buckets={bucket_preview}"
+                )
+
+                pick = _stratified_pick_indices(
+                    docs,
+                    lim_int,
+                    bucket_field=bucket_field,
+                    counts=counts,
+                    seed=seed,
+                )
+
+                picked_docs = [docs[i] for i in pick]
+                task._codec_selected_doc_indices = pick
+
+                eval_logger.info(
+                    f"[VideoMME stratified limit] task={task_name}, counts={counts}, bucket_field={bucket_field}, selected={len(picked_docs)}"
+                )
+
+                # 이미 subset으로 줄였으므로 다시 앞에서 limit 자르지 않음
+                task_limit = None
+                task_offset = 0
+
+        task._codec_limit = task_limit
+        task._codec_offset = task_offset
+
+        task_limit = get_sample_size(task, task_limit)
         task.build_all_requests(
-            limit=limit,
-            offset=offset,
+            limit=task_limit,
+            offset=task_offset,
             rank=global_rank,
             world_size=world_size,
             cache_requests=cache_requests,  # later we will add them
@@ -609,6 +736,8 @@ def evaluate(
     for task_output in eval_tasks:
         task = task_output.task
         task.apply_filters()
+        iter_limit = getattr(task, "_codec_limit", limit)
+        iter_offset = getattr(task, "_codec_offset", offset)
 
         ### Collect values of metrics on all datapoints ###
         # # unpack results and sort back in order and return control to Task
@@ -622,35 +751,15 @@ def evaluate(
             instances.sort(key=lambda x: x.idx)
         # iterate over different filters used
         for filter_key in task.instances[0].filtered_resps.keys():
-            if cli_args is not None and not cli_args.process_with_media:
-                doc_iterator = create_iterator(
-                    enumerate(task.eval_docs_no_media),
-                    rank=RANK,
-                    limit=int(limit) if limit else None,
-                    world_size=WORLD_SIZE,
-                    offset=offset,
-                )
-            else:
-                doc_iterator = task.doc_iterator(rank=RANK, limit=limit, world_size=WORLD_SIZE, offset=offset)
-            doc_iterator_for_counting = (
-                create_iterator(
-                    range(len(task.test_docs())),
-                    rank=RANK,
-                    limit=limit,
-                    world_size=WORLD_SIZE,
-                    offset=offset,
-                )
-                if task.has_test_docs()
-                else create_iterator(
-                    range(len(task.validation_docs())),
-                    rank=RANK,
-                    limit=limit,
-                    world_size=WORLD_SIZE,
-                    offset=offset,
-                )
+            doc_iterator = task.doc_iterator(
+                rank=RANK,
+                limit=iter_limit,
+                world_size=WORLD_SIZE,
+                offset=iter_offset,
             )
-            total_docs = sum(1 for _ in doc_iterator_for_counting)
+            total_docs = len(instances_by_doc_id)
             pbar = tqdm(total=total_docs, desc="Postprocessing", disable=(RANK != 0))
+            # pbar = tqdm(total=total_docs, desc="Postprocessing", disable=(RANK != 0))
             for doc_id, doc in doc_iterator:
                 requests = instances_by_doc_id[doc_id]
                 metrics = task.process_results(doc, [req.filtered_resps[filter_key] for req in requests])
@@ -807,9 +916,13 @@ def evaluate(
             "n-samples": {
                 task_output.task_name: {
                     "original": len(task_output.task.eval_docs),
-                    "effective": min(
-                        limit if limit else len(task_output.task.eval_docs),
-                        len(task_output.task.eval_docs),
+                    "effective": (
+                        len(task_output.task._codec_selected_doc_indices)
+                        if getattr(task_output.task, "_codec_selected_doc_indices", None) is not None
+                        else min(
+                            getattr(task_output.task, "_codec_limit", limit) if getattr(task_output.task, "_codec_limit", limit) else len(task_output.task.eval_docs),
+                            len(task_output.task.eval_docs),
+                        )
                     ),
                 }
                 for task_output in eval_tasks
