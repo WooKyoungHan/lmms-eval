@@ -181,6 +181,9 @@ class IPBSelectorConfig:
     beta_cov: float = 0.6
     seg_sec: float = 2.0
     nms_radius_sec: float = 0.25
+    hybrid_uniform_ratio: float = 0.0
+    hybrid_min_dist_sec: Optional[float] = None
+    hybrid_max_refill_rounds: int = 8
     g_ref: float = 0.5
     include_all_I: bool = True
 
@@ -329,6 +332,197 @@ def _choose_coverage_segments(
     cand_sorted = sorted(cand, key=lambda s: dist_to_nearest_I(s), reverse=True)
     take = cand_sorted[:K_cov]
     return [(s * seg_len, min(T, (s + 1) * seg_len)) for s in take]
+
+
+def _pick_uniform_indices(T: int, k: int) -> List[int]:
+    if T <= 0 or k <= 0:
+        return []
+    k = min(int(k), int(T))
+    idx = ((np.arange(k, dtype=np.float64) + 0.5) * float(T) / float(k)).astype(np.int64)
+    idx = np.clip(idx, 0, T - 1)
+    out: List[int] = []
+    seen = set()
+    for i in idx.tolist():
+        ii = int(i)
+        if ii not in seen:
+            out.append(ii)
+            seen.add(ii)
+    if len(out) < k:
+        for i in range(T):
+            if i not in seen:
+                out.append(i)
+                seen.add(i)
+            if len(out) >= k:
+                break
+    return sorted(out[:k])
+
+
+def _resolve_min_dist_radius_sec(cfg: IPBSelectorConfig) -> float:
+    if cfg.hybrid_min_dist_sec is None:
+        return float(cfg.nms_radius_sec)
+    return float(cfg.hybrid_min_dist_sec)
+
+
+def _build_blocked_mask(T: int, selected: Sequence[int], src_fps: float, radius_sec: float) -> np.ndarray:
+    blocked = np.zeros((T,), dtype=np.bool_)
+    if T <= 0:
+        return blocked
+    rad = max(0, int(round(float(radius_sec) * float(src_fps))))
+    for s in selected:
+        a = max(0, int(s) - rad)
+        b = min(T, int(s) + rad + 1)
+        blocked[a:b] = True
+    return blocked
+
+
+def _count_available_per_gop(
+    gops: Sequence[Tuple[int, int]],
+    blocked_mask: np.ndarray,
+) -> List[int]:
+    caps: List[int] = []
+    for a, b in gops:
+        caps.append(int((~blocked_mask[a:b]).sum()))
+    return caps
+
+
+def _pick_topk_in_segment_allowed(
+    *,
+    a: int,
+    b: int,
+    k: int,
+    scores: torch.Tensor,
+    frame_bytes: torch.Tensor,
+    ipb_code: torch.Tensor,
+    allowed_mask: np.ndarray,
+) -> List[int]:
+    if k <= 0 or b <= a:
+        return []
+
+    candidates = [i for i in range(a, b) if bool(allowed_mask[i])]
+    if not candidates:
+        return []
+
+    k = min(int(k), len(candidates))
+    if k == 1:
+        i_idx = [i for i in candidates if int(ipb_code[i].item()) == 1]
+        if i_idx:
+            best = max(i_idx, key=lambda i: int(frame_bytes[i].item()))
+            return [best]
+        best = max(candidates, key=lambda i: float(scores[i]))
+        return [best]
+
+    if k >= len(candidates):
+        return sorted(candidates)
+
+    pos = ((np.arange(k, dtype=np.float64) + 0.5) * float(len(candidates)) / float(k)).astype(np.int64)
+    pos = np.clip(pos, 0, len(candidates) - 1)
+    picked = sorted({candidates[int(j)] for j in pos.tolist()})
+    if len(picked) < k:
+        used = set(picked)
+        leftovers = [i for i in candidates if i not in used]
+        picked.extend(leftovers[: (k - len(picked))])
+    return sorted(picked[:k])
+
+
+def _allocate_and_pick_from_available(
+    *,
+    gops: Sequence[Tuple[int, int]],
+    weights: torch.Tensor,
+    scores: torch.Tensor,
+    frame_bytes: torch.Tensor,
+    ipb_code: torch.Tensor,
+    blocked_mask: np.ndarray,
+    K_target: int,
+    cfg: IPBSelectorConfig,
+    suspicious_mask: Optional[np.ndarray],
+    alloc_utility: str,
+) -> List[int]:
+    if K_target <= 0 or not gops:
+        return []
+
+    caps = _count_available_per_gop(gops, blocked_mask)
+    total_avail = int(sum(caps))
+    if total_avail <= 0:
+        return []
+
+    K_eff = min(int(K_target), total_avail)
+    budgets = _allocate_gop_budgets_heap(
+        weights,
+        caps,
+        K_eff,
+        utility=alloc_utility,
+        alpha=float(cfg.alpha),
+        beta=float(cfg.beta),
+        min_per_gop_if_possible=cfg.propfair_min_per_gop_if_possible,
+        min_floor_mask=None if suspicious_mask is None else (~suspicious_mask).tolist(),
+    )
+
+    allowed_mask = ~blocked_mask
+    chosen: List[int] = []
+    for gi, (a, b) in enumerate(gops):
+        k_i = int(budgets[gi])
+        if k_i <= 0:
+            continue
+        picks = _pick_topk_in_segment_allowed(
+            a=a,
+            b=b,
+            k=k_i,
+            scores=scores,
+            frame_bytes=frame_bytes,
+            ipb_code=ipb_code,
+            allowed_mask=allowed_mask,
+        )
+        chosen.extend(picks)
+    return sorted(set(chosen))
+
+
+def _hybrid_refill_selection(
+    *,
+    T: int,
+    gops: Sequence[Tuple[int, int]],
+    weights: torch.Tensor,
+    scores: torch.Tensor,
+    frame_bytes: torch.Tensor,
+    ipb_code: torch.Tensor,
+    initial_selected: Sequence[int],
+    src_fps: float,
+    cfg: IPBSelectorConfig,
+    K: int,
+    suspicious_mask: Optional[np.ndarray],
+    alloc_utility: str,
+) -> List[int]:
+    chosen = sorted(set(int(i) for i in initial_selected))
+    radius_sec = _resolve_min_dist_radius_sec(cfg)
+
+    for _ in range(max(1, int(cfg.hybrid_max_refill_rounds))):
+        if len(chosen) >= K:
+            break
+        blocked_mask = _build_blocked_mask(T, chosen, float(src_fps), radius_sec)
+        new_picks = _allocate_and_pick_from_available(
+            gops=gops,
+            weights=weights,
+            scores=scores,
+            frame_bytes=frame_bytes,
+            ipb_code=ipb_code,
+            blocked_mask=blocked_mask,
+            K_target=(K - len(chosen)),
+            cfg=cfg,
+            suspicious_mask=suspicious_mask,
+            alloc_utility=alloc_utility,
+        )
+        new_only = [i for i in new_picks if i not in set(chosen)]
+        if not new_only:
+            break
+        chosen = sorted(set(chosen).union(new_only))
+
+    if len(chosen) < K:
+        blocked_mask = _build_blocked_mask(T, chosen, float(src_fps), radius_sec)
+        leftovers = [i for i in range(T) if not bool(blocked_mask[i]) and i not in set(chosen)]
+        leftovers = sorted(leftovers, key=lambda i: float(scores[i]), reverse=True)
+        chosen.extend(leftovers[: (K - len(chosen))])
+        chosen = sorted(set(chosen))
+
+    return chosen[:K]
 
 
 # -----------------------------
@@ -935,25 +1129,25 @@ def _pick_topk_in_segment(
         best = max(candidates, key=lambda i: float(scores[i]))
         return [best]
 
-    # if k >= 2:
-    #     p_idx = [i for i in candidates if int(ipb_code[i].item()) == 0]
-    #     b_idx = [i for i in candidates if int(ipb_code[i].item()) == -1]
-    #     i_idx = [i for i in candidates if int(ipb_code[i].item()) == 1]
-
-    #     p_sorted = sorted(p_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
-    #     b_sorted = sorted(b_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
-    #     i_sorted = sorted(i_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
-
-    #     ordered = i_sorted +p_sorted + b_sorted 
-    #     return sorted(ordered[:k])
     if k >= 2:
-        L = b - a
-        if k >= L:
-            return list(range(a, b))
+        i_idx = [i for i in candidates if int(ipb_code[i].item()) == 1]
+        p_idx = [i for i in candidates if int(ipb_code[i].item()) == 0]
+        b_idx = [i for i in candidates if int(ipb_code[i].item()) == -1]
 
-        # uniform sampling (segment midpoints)
-        idx = a + ((np.arange(k) + 0.5) * L / k).astype(int)
-        return idx.tolist()
+        i_sorted = sorted(i_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
+        p_sorted = sorted(p_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
+        b_sorted = sorted(b_idx, key=lambda i: int(frame_bytes[i].item()), reverse=True)
+
+        ordered = i_sorted +p_sorted + b_sorted 
+        return sorted(ordered[:k])
+    # if k >= 2:
+    #     L = b - a
+    #     if k >= L:
+    #         return list(range(a, b))
+
+    #     # uniform sampling (segment midpoints)
+    #     idx = a + ((np.arange(k) + 0.5) * L / k).astype(int)
+    #     return idx.tolist()
     picked = _temporal_nms_pick(
         candidates,
         scores,
@@ -995,16 +1189,12 @@ def select_frame_indices_ipb_propfair_gop(
     cfg: IPBSelectorConfig,
 ) -> List[int]:
     """
-    GOP 단위 proportional-fair allocation:
-      1) ffprobe로 pict_type + pkt_size만 읽음
-      2) I 기준으로 GOP 분할
-      3) GOP별 utility: u_i(b_i) = w_i * log(1 + b_i)
-      4) greedy marginal gain으로 GOP budget b_i 배정
-      5) 각 GOP 내부에서 score top-k (with temporal NMS)로 실제 idx 선택
+    GOP 단위 proportional-fair allocation + optional hybrid uniform anchors.
 
-    주의:
-      - 이 첫 버전은 include_all_I를 따로 강제하지 않는다.
-      - 즉, budget K 안에서 utility가 알아서 분배한다.
+    1) 전체 budget K 중 일부를 uniform anchor로 먼저 고정
+    2) 남은 budget은 GOP-based allocator로 분배
+    3) 이미 선택된 frame 근처(중복/근접)는 block 처리
+    4) 부족분이 생기면 남은 가용 frame에 대해 allocator를 다시 돌려 재분배
     """
     ipb_str, pkt_sizes = _ffprobe_pict_types_and_pkt_sizes(video_path)
     T = min(len(ipb_str), len(pkt_sizes))
@@ -1029,7 +1219,6 @@ def select_frame_indices_ipb_propfair_gop(
     if K <= 0:
         return []
 
-    # 기존 mode_global 로직 재사용: bytes / typed_bytes 모두 가능
     scores = _build_frame_scores(
         ipb_code=ipb_code,
         frame_bytes=frame_bytes,
@@ -1037,17 +1226,14 @@ def select_frame_indices_ipb_propfair_gop(
         type_weights=cfg.type_weights,
     )
 
-    # GOP 분할 (I ~ next I)
     gops_raw = _build_gop_ranges_from_I(ipb_code)
     L_min = _choose_L_min(gops_raw, src_fps, q=10.0, t_min_sec=1)
-    gops = [(a,b) for (a,b) in gops_raw if (b-a) >= L_min]
+    gops = [(a, b) for (a, b) in gops_raw if (b - a) >= L_min]
     if not gops:
         return []
 
-    gop_debug_stats: Optional[List[Dict[str, float]]] = None
+    suspicious_mask: Optional[np.ndarray] = None
     alloc_utility = cfg.utility
-
-    # proportional-fair weight
     if cfg.utility == "v3":
         frame_motion_mass = _extract_frame_motion_masses_pyav(
             video_path,
@@ -1071,48 +1257,47 @@ def select_frame_indices_ipb_propfair_gop(
             rate_q=float(cfg.v3_susp_rate_q),
             eff_q=float(cfg.v3_susp_eff_q),
         )
-        # v3 uses motion-aware weights, then allocates frames with the usual concave kernel.
-        # suspicious GOPs are excluded only from the minimum-per-GOP floor allocation.
         alloc_utility = "exp"
     else:
         weights = _compute_gop_propfair_weights(gops, scores)
 
-    # 각 GOP 최대 수용량 = GOP 길이
-    caps = [b - a for (a, b) in gops]
+    uniform_ratio = float(cfg.hybrid_uniform_ratio)
+    if uniform_ratio < 0.0 or uniform_ratio > 1.0:
+        raise ValueError(f"hybrid_uniform_ratio must be in [0, 1], got {uniform_ratio}")
 
-    # GOP별 frame budget 할당
-    budgets = _allocate_gop_budgets_heap(
-        weights, caps, K,
-        utility=alloc_utility,
-        alpha=float(cfg.alpha),
-        beta=float(cfg.beta),
-        min_per_gop_if_possible=cfg.propfair_min_per_gop_if_possible,
-        min_floor_mask=None if suspicious_mask is None else (~suspicious_mask).tolist(),
+    K_uniform = min(K, max(0, int(round(K * uniform_ratio))))
+    uniform_selected = _pick_uniform_indices(T, K_uniform)
+
+    blocked_mask = _build_blocked_mask(T, uniform_selected, float(src_fps), _resolve_min_dist_radius_sec(cfg))
+    adaptive_selected = _allocate_and_pick_from_available(
+        gops=gops,
+        weights=weights,
+        scores=scores,
+        frame_bytes=frame_bytes,
+        ipb_code=ipb_code,
+        blocked_mask=blocked_mask,
+        K_target=(K - len(uniform_selected)),
+        cfg=cfg,
+        suspicious_mask=suspicious_mask,
+        alloc_utility=alloc_utility,
     )
 
-    # GOP 내부 실제 frame idx 선택
-    chosen: List[int] = []
-    for gi, (a, b) in enumerate(gops):
-        k_i = budgets[gi]
-        if k_i <= 0:
-            continue
+    chosen = sorted(set(uniform_selected).union(adaptive_selected))
+    chosen = _hybrid_refill_selection(
+        T=T,
+        gops=gops,
+        weights=weights,
+        scores=scores,
+        frame_bytes=frame_bytes,
+        ipb_code=ipb_code,
+        initial_selected=chosen,
+        src_fps=float(src_fps),
+        cfg=cfg,
+        K=K,
+        suspicious_mask=suspicious_mask,
+        alloc_utility=alloc_utility,
+    )
 
-        picks = _pick_topk_in_segment(
-            a=a,
-            b=b,
-            k=k_i,
-            scores=scores,
-            frame_bytes=frame_bytes,
-            ipb_code=ipb_code,
-            src_fps=float(src_fps),
-            nms_radius_sec=float(cfg.nms_radius_sec),
-        )
-        chosen.extend(picks)
-
-    # 혹시나 중복/오차 방어
-    chosen = sorted(set(chosen))
-
-    # hard cap
     if len(chosen) > K:
         chosen = sorted(chosen, key=lambda i: float(scores[i]), reverse=True)[:K]
         chosen = sorted(chosen)

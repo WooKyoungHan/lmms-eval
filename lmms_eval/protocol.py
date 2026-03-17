@@ -26,6 +26,75 @@ fetch_video, _has_qwen_vl = optional_import("qwen_vl_utils", "fetch_video")
 _FRAME_STATS = {"records": []}
 _BASE_FPS = 2.0
 
+def _resolve_hybrid_uniform_ratio(video_kwargs: Dict[str, Any]) -> float:
+    """
+    Priority:
+      1) video_kwargs["hybrid_uniform_ratio"]
+      2) env LMMS_HYBRID_UNIFORM_RATIO
+      3) default 0.0
+    """
+    v = (video_kwargs or {}).get("hybrid_uniform_ratio", None)
+    try:
+        if v is not None:
+            v = float(v)
+            return max(0.0, min(1.0, v))
+    except Exception:
+        pass
+
+    env = os.environ.get("LMMS_HYBRID_UNIFORM_RATIO", "").strip()
+    try:
+        if env:
+            env = float(env)
+            return max(0.0, min(1.0, env))
+    except Exception:
+        pass
+
+    return 0.0
+
+
+def _resolve_hybrid_min_dist_sec(video_kwargs: Dict[str, Any]) -> Optional[float]:
+    """
+    Priority:
+      1) video_kwargs["hybrid_min_dist_sec"]
+      2) env LMMS_HYBRID_MIN_DIST_SEC
+      3) None
+    """
+    v = _coerce_float((video_kwargs or {}).get("hybrid_min_dist_sec", None))
+    if v is not None:
+        return float(v)
+
+    env = _coerce_float(os.environ.get("LMMS_HYBRID_MIN_DIST_SEC", "").strip() or None)
+    if env is not None:
+        return float(env)
+
+    return None
+
+
+def _resolve_hybrid_max_refill_rounds(video_kwargs: Dict[str, Any]) -> int:
+    """
+    Priority:
+      1) video_kwargs["hybrid_max_refill_rounds"]
+      2) env LMMS_HYBRID_MAX_REFILL_ROUNDS
+      3) 8
+    """
+    v = (video_kwargs or {}).get("hybrid_max_refill_rounds", None)
+    try:
+        if v is not None:
+            v = int(v)
+            return max(1, v)
+    except Exception:
+        pass
+
+    env = os.environ.get("LMMS_HYBRID_MAX_REFILL_ROUNDS", "").strip()
+    try:
+        if env:
+            env = int(env)
+            return max(1, env)
+    except Exception:
+        pass
+
+    return 8
+
 def _dump_frame_stats():
     path = os.environ.get("LMMS_FRAME_STATS_PATH", "").strip()
     if not path:
@@ -129,7 +198,7 @@ def _resolve_fps(video_kwargs: Dict[str, Any]) -> Optional[float]:
     return None
 
 def _resolve_utility(video_kwargs: Dict[str, Any]) -> str:
-    """
+    """third_party/lmms-eval/lmms_eval/frame_selectors/__pycache__
     Decide IPB utility function for GOP allocator.
     Priority:
       1) video_kwargs["utility"] if present
@@ -262,9 +331,21 @@ class ChatMessages(BaseModel):
                     elif algo in {"ipb", "ipb_v2"}:
                         utility = _resolve_utility(video_kwargs)
                         alpha, beta = _resolve_alpha_beta(video_kwargs)
+                        hybrid_uniform_ratio = _resolve_hybrid_uniform_ratio(video_kwargs)
+                        hybrid_min_dist_sec = _resolve_hybrid_min_dist_sec(video_kwargs)
+                        hybrid_max_refill_rounds = _resolve_hybrid_max_refill_rounds(video_kwargs)
 
                         # cfg = IPBSelectorConfig(fps=req_fps, utility=utility, alpha=alpha, beta=beta)
-                        cfg = IPBSelectorConfig(fps=float(_BASE_FPS), budget_ratio=br, utility=utility, alpha=alpha, beta=beta)
+                        cfg = IPBSelectorConfig(
+                            fps=float(_BASE_FPS),
+                            budget_ratio=br,
+                            utility=utility,
+                            alpha=alpha,
+                            beta=beta,
+                            hybrid_uniform_ratio=hybrid_uniform_ratio,
+                            hybrid_min_dist_sec=hybrid_min_dist_sec,
+                            hybrid_max_refill_rounds=hybrid_max_refill_rounds,
+                        )
                         if algo == "ipb":
                             payload["frame_indices"] = select_frame_indices_ipb(content.url, cfg)
                         else:
@@ -334,7 +415,21 @@ class ChatMessages(BaseModel):
                     elif algo in {"ipb", "ipb_v2"}:
                         utility = _resolve_utility(video_kwargs)
                         alpha, beta = _resolve_alpha_beta(video_kwargs)
-                        cfg = IPBSelectorConfig(fps=float(_BASE_FPS), utility=utility, alpha=alpha, beta=beta)
+                        hybrid_uniform_ratio = _resolve_hybrid_uniform_ratio(video_kwargs)
+                        hybrid_min_dist_sec = _resolve_hybrid_min_dist_sec(video_kwargs)
+                        hybrid_max_refill_rounds = _resolve_hybrid_max_refill_rounds(video_kwargs)
+
+                        cfg = IPBSelectorConfig(
+                            fps=float(_BASE_FPS),
+                            budget_ratio=br,
+                            utility=utility,
+                            alpha=alpha,
+                            beta=beta,
+                            hybrid_uniform_ratio=hybrid_uniform_ratio,
+                            hybrid_min_dist_sec=hybrid_min_dist_sec,
+                            hybrid_max_refill_rounds=hybrid_max_refill_rounds,
+                        )
+
                         if algo == "ipb":
                             payload["frame_indices"] = select_frame_indices_ipb(content.url, cfg)
                         else:
