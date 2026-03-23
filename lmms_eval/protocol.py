@@ -17,6 +17,10 @@ from lmms_eval.frame_selectors.ipb_selector import (
     select_frame_indices_ipb,
     select_frame_indices_ipb_propfair_gop,
 )
+from lmms_eval.frame_selectors.patch_selector import (
+    PatchSelectorConfig,
+    select_patch_positions_for_frames,
+)
 
 # Optional video processing dependencies
 VideoReader, _has_decord = optional_import("decord", "VideoReader")
@@ -156,12 +160,12 @@ def _resolve_algo(video_kwargs: Dict[str, Any]) -> str:
     v = (video_kwargs or {}).get("frame_selector", None)
     if isinstance(v, str) and v.strip():
         v = v.strip().lower()
-        if v in {"ipb", "ipb_v2"}:
+        if v in {"ipb", "ipb_v2", "ipb_v4"}:
             return v
         return "default"
 
     env = os.environ.get("LMMS_USE_ALGO", "").strip().lower()
-    if env in {"ipb", "ipb_v2", "default"}:
+    if env in {"ipb", "ipb_v2", "ipb_v4", "default"}:
         return env
     return "default"
 
@@ -179,6 +183,140 @@ def _resolve_budget_ratio(video_kwargs: Dict[str, Any]) -> float:
     if env is not None:
         return float(env)
     return 1.0
+
+
+
+def _resolve_patch_keep_ratio(video_kwargs: Dict[str, Any]) -> float:
+    v = (video_kwargs or {}).get("codec_patch_keep_ratio", None)
+    try:
+        if v is not None:
+            v = float(v)
+            return max(0.0, min(1.0, v))
+    except Exception:
+        pass
+    env = os.environ.get("LMMS_CODEC_PATCH_KEEP_RATIO", "").strip()
+    try:
+        if env:
+            env = float(env)
+            return max(0.0, min(1.0, env))
+    except Exception:
+        pass
+    return 0.125
+
+
+def _resolve_patch_num_per_frame(video_kwargs: Dict[str, Any]) -> Optional[int]:
+    v = (video_kwargs or {}).get("codec_num_patches_per_frame", None)
+    try:
+        if v is not None:
+            return max(1, int(v))
+    except Exception:
+        pass
+    env = os.environ.get("LMMS_CODEC_NUM_PATCHES_PER_FRAME", "").strip()
+    try:
+        if env:
+            return max(1, int(env))
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_iframe_full(video_kwargs: Dict[str, Any]) -> bool:
+    v = (video_kwargs or {}).get("codec_iframe_full", None)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.strip():
+        return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+    env = os.environ.get("LMMS_CODEC_IFRAME_FULL", "").strip().lower()
+    if env:
+        return env in {"1", "true", "yes", "y", "on"}
+    return True
+
+
+def _resolve_patch_size(video_kwargs: Dict[str, Any]) -> int:
+    v = (video_kwargs or {}).get("codec_patch_size", None)
+    try:
+        if v is not None:
+            return max(1, int(v))
+    except Exception:
+        pass
+    env = os.environ.get("LMMS_CODEC_PATCH_SIZE", "").strip()
+    try:
+        if env:
+            return max(1, int(env))
+    except Exception:
+        pass
+    return 16
+
+
+def _resolve_square_size(video_kwargs: Dict[str, Any]) -> int:
+    v = (video_kwargs or {}).get("codec_square_size", None)
+    try:
+        if v is not None:
+            return max(16, int(v))
+    except Exception:
+        pass
+    env = os.environ.get("LMMS_CODEC_SQUARE_SIZE", "").strip()
+    try:
+        if env:
+            return max(16, int(env))
+    except Exception:
+        pass
+    return 576
+
+
+def _build_ipb_cfg(video_kwargs: Dict[str, Any], budget_ratio: float) -> IPBSelectorConfig:
+    utility = _resolve_utility(video_kwargs)
+    alpha, beta = _resolve_alpha_beta(video_kwargs)
+    hybrid_uniform_ratio = _resolve_hybrid_uniform_ratio(video_kwargs)
+    hybrid_min_dist_sec = _resolve_hybrid_min_dist_sec(video_kwargs)
+    hybrid_max_refill_rounds = _resolve_hybrid_max_refill_rounds(video_kwargs)
+    return IPBSelectorConfig(
+        fps=float(_BASE_FPS),
+        budget_ratio=budget_ratio,
+        utility=utility,
+        alpha=alpha,
+        beta=beta,
+        hybrid_uniform_ratio=hybrid_uniform_ratio,
+        hybrid_min_dist_sec=hybrid_min_dist_sec,
+        hybrid_max_refill_rounds=hybrid_max_refill_rounds,
+    )
+
+
+def _apply_frame_and_patch_selection_to_payload(video_url: str, payload: Dict[str, Any], video_kwargs: Dict[str, Any], algo: str, budget_ratio: float) -> None:
+    if algo == "default":
+        payload["fps"] = float(_BASE_FPS * budget_ratio)
+        return
+
+    cfg = _build_ipb_cfg(video_kwargs, budget_ratio)
+
+    if algo == "ipb":
+        frame_indices = select_frame_indices_ipb(video_url, cfg)
+    else:
+        frame_indices = select_frame_indices_ipb_propfair_gop(video_url, cfg)
+
+    payload["frame_indices"] = frame_indices
+
+    if algo == "ipb_v4":
+        patch_cfg = PatchSelectorConfig(
+            patch_size=_resolve_patch_size(video_kwargs),
+            square_size=_resolve_square_size(video_kwargs),
+            keep_ratio=_resolve_patch_keep_ratio(video_kwargs),
+            num_patches_per_frame=_resolve_patch_num_per_frame(video_kwargs),
+            iframe_full=_resolve_iframe_full(video_kwargs),
+        )
+        patch_out = select_patch_positions_for_frames(
+            video_path=video_url,
+            selected_frame_indices=frame_indices,
+            cfg=patch_cfg,
+        )
+        payload["codec_patchify"] = True
+        payload["codec_patch_positions"] = patch_out["patch_positions"]
+        payload["codec_patch_keep_ratio"] = patch_cfg.keep_ratio
+        payload["codec_num_patches_per_frame"] = patch_cfg.num_patches_per_frame
+        payload["codec_iframe_full"] = patch_cfg.iframe_full
+        payload["codec_patch_size"] = patch_cfg.patch_size
+        payload["codec_square_size"] = patch_cfg.square_size
+
 
 def _resolve_fps(video_kwargs: Dict[str, Any]) -> Optional[float]:
     """
@@ -325,31 +463,13 @@ class ChatMessages(BaseModel):
 
                     payload = {"type": "video", "video": content.url, **video_kwargs}
 
-                    # Ensure the resolved fps is actually present in payload if decided from env
-                    if algo == "default":
-                        payload["fps"] = float(_BASE_FPS*br)                     # If algo is ipb / ipb_v2, add frame_indices (pre-decode)
-                    elif algo in {"ipb", "ipb_v2"}:
-                        utility = _resolve_utility(video_kwargs)
-                        alpha, beta = _resolve_alpha_beta(video_kwargs)
-                        hybrid_uniform_ratio = _resolve_hybrid_uniform_ratio(video_kwargs)
-                        hybrid_min_dist_sec = _resolve_hybrid_min_dist_sec(video_kwargs)
-                        hybrid_max_refill_rounds = _resolve_hybrid_max_refill_rounds(video_kwargs)
-
-                        # cfg = IPBSelectorConfig(fps=req_fps, utility=utility, alpha=alpha, beta=beta)
-                        cfg = IPBSelectorConfig(
-                            fps=float(_BASE_FPS),
-                            budget_ratio=br,
-                            utility=utility,
-                            alpha=alpha,
-                            beta=beta,
-                            hybrid_uniform_ratio=hybrid_uniform_ratio,
-                            hybrid_min_dist_sec=hybrid_min_dist_sec,
-                            hybrid_max_refill_rounds=hybrid_max_refill_rounds,
-                        )
-                        if algo == "ipb":
-                            payload["frame_indices"] = select_frame_indices_ipb(content.url, cfg)
-                        else:
-                            payload["frame_indices"] = select_frame_indices_ipb_propfair_gop(content.url, cfg)
+                    _apply_frame_and_patch_selection_to_payload(
+                        video_url=content.url,
+                        payload=payload,
+                        video_kwargs=video_kwargs,
+                        algo=algo,
+                        budget_ratio=br,
+                    )
                     video_input = fetch_video(payload)
 
                     frames_used = int(video_input.shape[0]) if hasattr(video_input, "shape") else len(video_input)
@@ -408,32 +528,13 @@ class ChatMessages(BaseModel):
 
                     payload = {"type": "video", "video": content.url, **video_kwargs}
 
-                    # Ensure the resolved fps is actually present in payload if decided from env
-                    if algo == "default":
-                        payload["fps"] = float(_BASE_FPS*br)   
-
-                    elif algo in {"ipb", "ipb_v2"}:
-                        utility = _resolve_utility(video_kwargs)
-                        alpha, beta = _resolve_alpha_beta(video_kwargs)
-                        hybrid_uniform_ratio = _resolve_hybrid_uniform_ratio(video_kwargs)
-                        hybrid_min_dist_sec = _resolve_hybrid_min_dist_sec(video_kwargs)
-                        hybrid_max_refill_rounds = _resolve_hybrid_max_refill_rounds(video_kwargs)
-
-                        cfg = IPBSelectorConfig(
-                            fps=float(_BASE_FPS),
-                            budget_ratio=br,
-                            utility=utility,
-                            alpha=alpha,
-                            beta=beta,
-                            hybrid_uniform_ratio=hybrid_uniform_ratio,
-                            hybrid_min_dist_sec=hybrid_min_dist_sec,
-                            hybrid_max_refill_rounds=hybrid_max_refill_rounds,
-                        )
-
-                        if algo == "ipb":
-                            payload["frame_indices"] = select_frame_indices_ipb(content.url, cfg)
-                        else:
-                            payload["frame_indices"] = select_frame_indices_ipb_propfair_gop(content.url, cfg)
+                    _apply_frame_and_patch_selection_to_payload(
+                        video_url=content.url,
+                        payload=payload,
+                        video_kwargs=video_kwargs,
+                        algo=algo,
+                        budget_ratio=br,
+                    )
                     video_input, sampled_fps = fetch_video(
                         payload,
                         return_video_metadata=True,

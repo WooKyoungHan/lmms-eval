@@ -250,6 +250,12 @@ class Qwen3_VL(lmms):
                                     "video": visual,
                                     "max_pixels": self.max_pixels,
                                     "min_pixels": self.min_pixels,
+                                    # "frame_indices": frame_indices,
+                                    # "codec_token_prune": True,
+                                    # "codec_keep_thw": keep_thw,
+                                    # "codec_iframe_full": iframe_full,
+                                    # "codec_patch_size": patch_size,
+                                    # "codec_frame_types": frame_types,
                                 }
                             )
                         elif isinstance(visual, Image.Image):  # Handle both single and multiple images
