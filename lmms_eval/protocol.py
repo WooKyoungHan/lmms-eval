@@ -30,6 +30,61 @@ fetch_video, _has_qwen_vl = optional_import("qwen_vl_utils", "fetch_video")
 _FRAME_STATS = {"records": []}
 _BASE_FPS = 2.0
 
+
+def _resolve_budget_frames(video_kwargs: Dict[str, Any]) -> Optional[int]:
+    """
+    Priority:
+      1) video_kwargs["budget_frames"]
+      2) env LMMS_BUDGET_FRAMES
+      3) None
+    """
+    v = (video_kwargs or {}).get("budget_frames", None)
+    try:
+        if v is not None:
+            iv = int(v)
+            if iv > 0:
+                return iv
+    except Exception:
+        pass
+
+    env = os.environ.get("LMMS_BUDGET_FRAMES", "").strip()
+    try:
+        if env:
+            iv = int(env)
+            if iv > 0:
+                return iv
+    except Exception:
+        pass
+
+    return None
+
+
+def _validate_budget_controls(video_kwargs: Dict[str, Any]) -> None:
+    br_from_kwargs = _coerce_float((video_kwargs or {}).get("budget_ratio", None))
+    k_from_kwargs = (video_kwargs or {}).get("budget_frames", None)
+
+    has_br_kwargs = br_from_kwargs is not None
+    has_k_kwargs = False
+    try:
+        has_k_kwargs = (k_from_kwargs is not None) and (int(k_from_kwargs) > 0)
+    except Exception:
+        has_k_kwargs = False
+
+    br_env = _coerce_float(os.environ.get("LMMS_BUDGET_RATIO", "").strip() or None)
+    k_env_raw = os.environ.get("LMMS_BUDGET_FRAMES", "").strip()
+    has_br_env = br_env is not None
+    has_k_env = False
+    try:
+        has_k_env = bool(k_env_raw) and (int(k_env_raw) > 0)
+    except Exception:
+        has_k_env = False
+
+    has_br = has_br_kwargs or has_br_env
+    has_k = has_k_kwargs or has_k_env
+
+    if has_br and has_k:
+        raise ValueError("budget_ratio and budget_frames cannot be used together")
+
 def _resolve_hybrid_uniform_ratio(video_kwargs: Dict[str, Any]) -> float:
     """
     Priority:
@@ -270,9 +325,12 @@ def _build_ipb_cfg(video_kwargs: Dict[str, Any], budget_ratio: float) -> IPBSele
     hybrid_uniform_ratio = _resolve_hybrid_uniform_ratio(video_kwargs)
     hybrid_min_dist_sec = _resolve_hybrid_min_dist_sec(video_kwargs)
     hybrid_max_refill_rounds = _resolve_hybrid_max_refill_rounds(video_kwargs)
+    budget_frames = _resolve_budget_frames(video_kwargs)
+
     return IPBSelectorConfig(
         fps=float(_BASE_FPS),
         budget_ratio=budget_ratio,
+        budget_frames=budget_frames,
         utility=utility,
         alpha=alpha,
         beta=beta,
@@ -281,10 +339,21 @@ def _build_ipb_cfg(video_kwargs: Dict[str, Any], budget_ratio: float) -> IPBSele
         hybrid_max_refill_rounds=hybrid_max_refill_rounds,
     )
 
+def _apply_frame_and_patch_selection_to_payload(
+    video_url: str,
+    payload: Dict[str, Any],
+    video_kwargs: Dict[str, Any],
+    algo: str,
+    budget_ratio: float,
+) -> None:
+    _validate_budget_controls(video_kwargs)
+    budget_frames = _resolve_budget_frames(video_kwargs)
 
-def _apply_frame_and_patch_selection_to_payload(video_url: str, payload: Dict[str, Any], video_kwargs: Dict[str, Any], algo: str, budget_ratio: float) -> None:
     if algo == "default":
-        payload["fps"] = float(_BASE_FPS * budget_ratio)
+        if budget_frames is not None:
+            payload["frame_budget"] = int(budget_frames)
+        else:
+            payload["fps"] = float(_BASE_FPS * budget_ratio)
         return
 
     cfg = _build_ipb_cfg(video_kwargs, budget_ratio)

@@ -176,7 +176,7 @@ class IPBSelectorConfig:
     budget_ratio: float = 1.0
     max_budget: int = 2048
     num_frm_cap: int = 10000
-
+    budget_frames: Optional[int] = None
     # adaptive policy (existing)
     beta_cov: float = 0.6
     seg_sec: float = 2.0
@@ -223,18 +223,15 @@ def _compute_budget_K(
     budget_ratio: float,
     max_budget: int,
     num_frm_cap: int,
+    budget_frames: Optional[int] = None,
 ) -> int:
-    """
-    Budget rule:
-        base_budget = max(duration_sec * target_fps, max_budget)
-        K = round(base_budget * budget_ratio)
-
-    - budget_ratio must be in [0, 1]
-    - if target_fps is None / invalid, base_budget := max_budget
-    - final hard cap: K <= T and K <= num_frm_cap
-    """
     if T <= 0:
         return 0
+
+    if budget_frames is not None:
+        K = int(budget_frames)
+        K = max(1, K)
+        return min(T, K, int(num_frm_cap))
 
     br = float(budget_ratio)
     if br < 0.0 or br > 1.0:
@@ -556,6 +553,7 @@ def select_frame_indices_ipb(
         float(cfg.budget_ratio),
         int(cfg.max_budget),
         int(cfg.num_frm_cap),
+        budget_frames=cfg.budget_frames,
     )
     if K <= 0:
         return []
@@ -1215,6 +1213,7 @@ def select_frame_indices_ipb_propfair_gop(
         float(cfg.budget_ratio),
         int(cfg.max_budget),
         int(cfg.num_frm_cap),
+        budget_frames=cfg.budget_frames,
     )
     if K <= 0:
         return []
@@ -1344,6 +1343,7 @@ def analyze_ipb_propfair_gop(
         float(cfg.budget_ratio),
         int(cfg.max_budget),
         int(cfg.num_frm_cap),
+        budget_frames=cfg.budget_frames,
     )
 
     gops_raw = _build_gop_ranges_from_I(ipb_code)

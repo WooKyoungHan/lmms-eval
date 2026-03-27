@@ -24,9 +24,126 @@ from lmms_eval.models.model_utils.reasoning_model_utils import (
     parse_reasoning_model_answer,
 )
 
+import os
+
+from lmms_eval.frame_selectors.ipb_selector import (
+    IPBSelectorConfig,
+    select_frame_indices_ipb_propfair_gop,
+)
+from lmms_eval.frame_selectors.patch_selector import (
+    PatchSelectorConfig,
+    select_patch_positions_for_frames,
+)
+
+
 process_vision_info, _has_qwen_vl = optional_import("qwen_vl_utils", "process_vision_info")
 if not _has_qwen_vl:
     eval_logger.warning("Failed to import qwen_vl_utils; Please install it via `pip install qwen-vl-utils`")
+
+
+def _append_frame_stats(video_path: str, frame_indices: list[int]) -> None:
+    frame_stats_path = os.environ.get("LMMS_FRAME_STATS_PATH", "").strip()
+    if not frame_stats_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(frame_stats_path), exist_ok=True)
+        import json
+        with open(frame_stats_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "video": video_path,
+                "num_selected": int(len(frame_indices)),
+                "frame_indices": list(map(int, frame_indices)),
+            }, ensure_ascii=False) + "\n")
+    except Exception as e:
+        eval_logger.warning(f"Failed to write frame stats to {frame_stats_path}: {e}")
+
+def _normalize_mcqa_prompt(context: str) -> str:
+    """
+    Wrap MCQA prompts with the legacy VideoMME instruction format and
+    remove explicit Question:/Options: section headers.
+    """
+    body = context.strip()
+    if body.startswith("Question: "):
+        body = body[len("Question: "):]
+    body = body.replace("\nOptions:", "", 1)
+    body = body.replace("Question:", "")
+    body = body.replace("Options:", "")
+    body = body.replace("\nAnswer with the option letter only.", "")
+    body = body.replace("\nAnswer with the option letter only.", "")
+    body = body.strip()
+    return ("Select the best answer to the following multiple-choice question based on the video and the subtitles. Respond with only the letter (A, B, C, or D) of the correct option.\n"+ body + "\n\nAnswer with the option's letter from the given choices directly."
+    )
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name, None)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except Exception:
+        return default
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return default
+
+def _build_ipb_video_payload(visual: str, max_pixels: int, min_pixels: int) -> dict:
+    payload = {
+        "type": "video",
+        "video": visual,
+        "max_pixels": max_pixels,
+        "min_pixels": min_pixels,
+    }
+    algo = os.environ.get("LMMS_USE_ALGO", "").strip().lower()
+    if not algo:
+        return payload
+
+    budget_ratio = _env_float("LMMS_BUDGET_RATIO", 1.0)
+    utility = os.environ.get("LMMS_IPB_UTILITY", "v3")
+    hybrid_uniform_ratio = _env_float("LMMS_HYBRID_UNIFORM_RATIO", 0.0)
+    hybrid_min_dist_sec = _env_float("LMMS_HYBRID_MIN_DIST_SEC", 0.0)
+    hybrid_max_refill_rounds = _env_int("LMMS_HYBRID_MAX_REFILL_ROUNDS", 0)
+
+    cfg = IPBSelectorConfig(
+        fps=_env_float("LMMS_VIDEO_FPS", 2.0),
+        budget_ratio=budget_ratio,
+        utility=utility,
+        hybrid_uniform_ratio=hybrid_uniform_ratio,
+        hybrid_min_dist_sec=hybrid_min_dist_sec,
+        hybrid_max_refill_rounds=hybrid_max_refill_rounds,
+    )
+    frame_indices = select_frame_indices_ipb_propfair_gop(visual, cfg)
+    payload["frame_indices"] = list(map(int, frame_indices))
+    _append_frame_stats(visual, payload["frame_indices"])
+
+    if algo == "ipb_v4":
+        patch_cfg = PatchSelectorConfig(
+            patch_size=_env_int("LMMS_CODEC_PATCH_SIZE", 16),
+            square_size=_env_int("LMMS_CODEC_SQUARE_SIZE", 576),
+            keep_ratio=_env_float("LMMS_CODEC_PATCH_KEEP_RATIO", 0.125),
+            num_patches_per_frame=(
+                None if os.environ.get("LMMS_CODEC_NUM_PATCHES_PER_FRAME") in (None, "", "none", "None")
+                else _env_int("LMMS_CODEC_NUM_PATCHES_PER_FRAME", 0)
+            ),
+            iframe_full=_env_flag("LMMS_CODEC_IFRAME_FULL", True),
+        )
+        patch_out = select_patch_positions_for_frames(
+            video_path=visual,
+            selected_frame_indices=payload["frame_indices"],
+            cfg=patch_cfg,
+        )
+        payload["codec_token_prune"] = True
+        payload["codec_keep_thw"] = patch_out["patch_positions"]
+        payload["codec_patch_size"] = patch_cfg.patch_size
+        payload["codec_iframe_full"] = patch_cfg.iframe_full
+        payload["codec_frame_types"] = patch_out.get("frame_types", None)
+        payload["codec_coord_space"] = "square_grid"
+    return payload
 
 
 @register_model("qwen3_vl")
@@ -50,7 +167,7 @@ class Qwen3_VL(lmms):
         use_custom_video_loader: Optional[bool] = False,
         fps: Optional[float] = None,  # Only applicable if use_custom_video_loader is True
         max_image_size: Optional[int] = None,  # Only applicable if use_custom_video_loader is True
-        system_prompt: Optional[str] = "You are a helpful assistant.",
+        system_prompt: Optional[str] = "",
         interleave_visuals: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
         **kwargs,
@@ -230,8 +347,13 @@ class Qwen3_VL(lmms):
             for i, context in enumerate(contexts):
                 if "<image>" in context:
                     context = context.replace("<image>", "")
-
-                message = [{"role": "system", "content": self.system_prompt}]
+                # print(context)
+                context = _normalize_mcqa_prompt(context)
+                # print(context)
+                contexts[i] = context
+                message = []
+                if self.system_prompt:
+                    message.append({"role": "system", "content": self.system_prompt})
                 if self.reasoning_prompt:
                     context = context.strip() + self.reasoning_prompt
                     contexts[i] = context
@@ -245,18 +367,11 @@ class Qwen3_VL(lmms):
                             height, width = first_frame.shape[:2]
                             # max_pixels = height * width
                             processed_visuals.append(
-                                {
-                                    "type": "video",
-                                    "video": visual,
-                                    "max_pixels": self.max_pixels,
-                                    "min_pixels": self.min_pixels,
-                                    # "frame_indices": frame_indices,
-                                    # "codec_token_prune": True,
-                                    # "codec_keep_thw": keep_thw,
-                                    # "codec_iframe_full": iframe_full,
-                                    # "codec_patch_size": patch_size,
-                                    # "codec_frame_types": frame_types,
-                                }
+                                _build_ipb_video_payload(
+                                    visual=visual,
+                                    max_pixels=self.max_pixels,
+                                    min_pixels=self.min_pixels,
+                                )
                             )
                         elif isinstance(visual, Image.Image):  # Handle both single and multiple images
                             processed_visuals.append(
@@ -306,25 +421,33 @@ class Qwen3_VL(lmms):
                 image_patch_size=16,
                 return_video_metadata=False,
             )
+
+            codec_keep_thw = []
+            codec_token_prune = False
+            for message in batched_messages:
+                for content in message:
+                    if content["role"] != "user":
+                        continue
+                    for part in content["content"]:
+                        if isinstance(part, dict) and part.get("type") == "video":
+                            if part.get("codec_token_prune", False):
+                                codec_token_prune = True
+                            codec_keep_thw.append(part.get("codec_keep_thw", None))
+
             if video_inputs is not None:
-                total_frames = video_inputs[0].shape[0]
-                indices = np.linspace(0, total_frames - 1, self.max_num_frames, dtype=int)
-                # Ensure unique indices if linspace produces duplicates for few frames
-                indices = np.unique(indices)
-                # Append the last frame index if not already included
-                if total_frames - 1 not in indices:
-                    indices = np.append(indices, total_frames - 1)
-                    indices = np.unique(indices)  # Ensure uniqueness again
-                video_inputs[0] = video_inputs[0][indices]
+                eval_logger.info(f"[qwen3_vl] keeping all selected decoded frames: {tuple(video_inputs[0].shape)}")
             if self.batch_size > 1:
                 inputs = self.processor(
                     text=texts,
                     images=image_inputs,
                     videos=video_inputs,
                     do_resize=False,
+                    do_sample_frames=False,
                     padding=True,
                     padding_side="left",
                     return_tensors="pt",
+                    codec_token_prune=codec_token_prune,
+                    codec_keep_thw=codec_keep_thw if codec_keep_thw else None,
                 )
             else:
                 inputs = self.processor(
@@ -332,14 +455,20 @@ class Qwen3_VL(lmms):
                     images=image_inputs,
                     videos=video_inputs,
                     do_resize=False,
+                    do_sample_frames=False,
                     return_tensors="pt",
+                    codec_token_prune=codec_token_prune,
+                    codec_keep_thw=codec_keep_thw if codec_keep_thw else None,
                 )
             if self.device_map == "auto":
                 inputs = inputs.to("cuda")
             else:
                 inputs = inputs.to(self.device)
-
-            # Set default generation kwargs
+            print("[DBG][MODEL_INPUT] pixel_values_videos.shape =", tuple(inputs["pixel_values_videos"].shape))
+            print("[DBG][MODEL_INPUT] video_grid_thw =", inputs.get("video_grid_thw", None))
+            print("[DBG][MODEL_INPUT] image_processor =", self.processor.image_processor)            # Set default generation kwargs
+            print("[DBG][BEFORE-PROCESSOR] video_inputs[0].shape =", tuple(video_inputs[0].shape))
+            print("[DBG][MODEL_INPUT] video_grid_thw =", inputs["video_grid_thw"])  
             default_gen_kwargs = {
                 "max_new_tokens": 128,
                 "temperature": 0.0,  # Set to 0 for greedy default
