@@ -404,6 +404,41 @@ def _resolve_fps(video_kwargs: Dict[str, Any]) -> Optional[float]:
         return env
     return None
 
+
+def _get_active_model_name(video_kwargs: Dict[str, Any]) -> str:
+    video_kwargs = video_kwargs or {}
+    for key in ("model", "model_name", "pretrained"):
+        value = video_kwargs.get(key, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+
+    for env_key in ("MODEL", "MODEL_NAME", "HF_MODEL_ID", "VLLM_MODEL"):
+        value = os.environ.get(env_key, "")
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+
+    return ""
+
+
+def _should_emit_video_url_for_model(video_kwargs: Dict[str, Any]) -> bool:
+    model_name = _get_active_model_name(video_kwargs)
+    if not model_name:
+        return False
+    return (
+        "llava-onevision" in model_name
+        or "llava_ov" in model_name
+        or "llava-ov" in model_name
+        or ("llava" in model_name and "onevision" in model_name)
+    )
+
+
+def _normalize_openai_video_url(video_url: Any) -> Any:
+    if not isinstance(video_url, str):
+        return video_url
+    if video_url.startswith(("http://", "https://", "file://", "data:")):
+        return video_url
+    return f"file://{os.path.abspath(video_url)}"
+
 def _resolve_utility(video_kwargs: Dict[str, Any]) -> str:
     """third_party/lmms-eval/lmms_eval/frame_selectors/__pycache__
     Decide IPB utility function for GOP allocator.
@@ -512,63 +547,37 @@ class ChatMessages(BaseModel):
             openai_message = {"role": message.role, "content": []}
             for content in message.content:
                 if content.type == "text":
-                    openai_message["content"].append({"type": "text", "text": content.text})
+                    openai_message["content"].append(
+                        {"type": "text", "text": content.text}
+                    )
                 elif content.type == "image":
                     openai_message["content"].append(
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{self.encode_image(content.url)}"},
+                            "image_url": {
+                                "url": f"data:image/png;base64,{self.encode_image(content.url)}"
+                            },
                         }
                     )
                 elif content.type == "video":
-                    if fetch_video is None:
-                        raise ImportError(
-                            "qwen_vl_utils is required for video processing. Please install it with: pip install qwen-vl-utils"
-                        )
-
-                    algo = _resolve_algo(video_kwargs)
-                    # req_fps = _resolve_fps(video_kwargs)
-                    br = _resolve_budget_ratio(video_kwargs)
-
-                    payload = {"type": "video", "video": content.url, **video_kwargs}
-
-                    _apply_frame_and_patch_selection_to_payload(
-                        video_url=content.url,
-                        payload=payload,
-                        video_kwargs=video_kwargs,
-                        algo=algo,
-                        budget_ratio=br,
+                    openai_message["content"].append(
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": _normalize_openai_video_url(content.url),
+                            },
+                        }
                     )
-                    video_input = fetch_video(payload)
-
-                    frames_used = int(video_input.shape[0]) if hasattr(video_input, "shape") else len(video_input)
-                    _record_frames_used(
-                        video_path=content.url,
-                        algo=algo,
-                        fps=float(_BASE_FPS*br) if float(_BASE_FPS*br) is not None else -1.0,
-                        frames_used=frames_used,
-                    )
-
-                    for frame in video_input:
-                        image = Image.fromarray(frame.permute(1, 2, 0).numpy().astype(np.uint8))
-                        openai_message["content"].append(
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{self.encode_image(image)}"},
-                            }
-                        )
                 elif content.type == "audio":
-                    openai_message["content"].append({"type": "audio_url", "audio_url": {"url": content.url}})
+                    openai_message["content"].append(
+                        {"type": "audio_url", "audio_url": {"url": content.url}}
+                    )
 
             openai_messages.append(openai_message)
 
         return openai_messages
 
     def to_qwen3_vl_openai_messages(self, video_kwargs: Dict[str, Any] = None):
-        """
-        Qwen3-VL: use fetch_video(..., return_video_metadata=True, return_video_sample_fps=True)
-        and insert timestamps between frames.
-        """
         if video_kwargs is None:
             video_kwargs = {}
 
@@ -577,64 +586,31 @@ class ChatMessages(BaseModel):
             openai_message = {"role": message.role, "content": []}
             for content in message.content:
                 if content.type == "text":
-                    openai_message["content"].append({"type": "text", "text": content.text})
+                    openai_message["content"].append(
+                        {"type": "text", "text": content.text}
+                    )
                 elif content.type == "image":
                     openai_message["content"].append(
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{self.encode_image(content.url)}"},
+                            "image_url": {
+                                "url": f"data:image/png;base64,{self.encode_image(content.url)}"
+                            },
                         }
                     )
                 elif content.type == "video":
-                    if fetch_video is None:
-                        raise ImportError(
-                            "qwen_vl_utils is required for video processing. Please install it with: pip install qwen-vl-utils"
-                        )
-
-                    algo = _resolve_algo(video_kwargs)
-                    # req_fps = _resolve_fps(video_kwargs)
-                    br = _resolve_budget_ratio(video_kwargs)
-
-                    payload = {"type": "video", "video": content.url, **video_kwargs}
-
-                    _apply_frame_and_patch_selection_to_payload(
-                        video_url=content.url,
-                        payload=payload,
-                        video_kwargs=video_kwargs,
-                        algo=algo,
-                        budget_ratio=br,
+                    openai_message["content"].append(
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": _normalize_openai_video_url(content.url),
+                            },
+                        }
                     )
-                    video_input, sampled_fps = fetch_video(
-                        payload,
-                        return_video_metadata=True,
-                        return_video_sample_fps=True,
-                    )
-
-                    frames, video_metadata = video_input
-                    frames_used = int(frames.shape[0])
-
-                    # Prefer requested fps if set; else metadata fps (actual)
-                    fps_for_log = float(_BASE_FPS*br) if float(_BASE_FPS*br) is not None else float(video_metadata.get("fps", -1.0))
-                    _record_frames_used(
-                        video_path=content.url,
-                        algo=algo,
-                        fps=fps_for_log,
-                        frames_used=frames_used,
-                    )
-
-                    timestamps = self._calculate_timestamps(video_metadata)
-                    for frame, timestamp in zip(frames, timestamps):
-                        image = Image.fromarray(frame.permute(1, 2, 0).numpy().astype(np.uint8))
-                        openai_message["content"].append({"type": "text", "text": f"<{timestamp:.1f} seconds>"})
-                        openai_message["content"].append(
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{self.encode_image(image)}"},
-                            }
-                        )
-
                 elif content.type == "audio":
-                    openai_message["content"].append({"type": "audio_url", "audio_url": {"url": content.url}})
+                    openai_message["content"].append(
+                        {"type": "audio_url", "audio_url": {"url": content.url}}
+                    )
 
             openai_messages.append(openai_message)
 
