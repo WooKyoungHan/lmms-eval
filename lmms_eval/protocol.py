@@ -503,6 +503,46 @@ class ChatMessage(BaseModel):
 class ChatMessages(BaseModel):
     messages: List[ChatMessage]
 
+    @staticmethod
+    def build_openai_extra_body(
+        video_kwargs: Dict[str, Any] | None = None,
+        extra_body: Dict[str, Any] | None = None,
+        include_default_limit: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Build runtime extra_body for vLLM OpenAI-compatible requests.
+
+        This is the correct place for request-level video backend / budget controls.
+        The OpenAI message payload itself should only carry the video URL.
+        """
+        video_kwargs = dict(video_kwargs or {})
+        out = dict(extra_body or {})
+
+        runtime_video_keys = {
+            "video_backend",
+            "num_frames",
+            "budget_frames",
+            "fps",
+            "max_duration",
+            "frame_indices",
+            "frames_indices",
+            "frame_recovery",
+            "return_selector_debug",
+        }
+
+        runtime_video_kwargs = {
+            k: v for k, v in video_kwargs.items()
+            if k in runtime_video_keys and v is not None
+        }
+
+        if runtime_video_kwargs:
+            out["media_io_kwargs"] = {"video": runtime_video_kwargs}
+
+        if include_default_limit and "limit_mm_per_prompt" not in out:
+            out["limit_mm_per_prompt"] = {"video": -1}
+
+        return out
+
     def extract_media(self):
         images = []
         videos = []
@@ -539,6 +579,9 @@ class ChatMessages(BaseModel):
         return hf_messages
 
     def to_openai_messages(self, video_kwargs: Dict[str, Any] = None):
+        # NOTE:
+        # video_kwargs is intentionally NOT embedded into the OpenAI message body.
+        # Request-level video controls must go through build_openai_extra_body(...).
         if video_kwargs is None:
             video_kwargs = {}
 
@@ -578,6 +621,9 @@ class ChatMessages(BaseModel):
         return openai_messages
 
     def to_qwen3_vl_openai_messages(self, video_kwargs: Dict[str, Any] = None):
+        # NOTE:
+        # video_kwargs is intentionally NOT embedded into the OpenAI message body.
+        # Request-level video controls must go through build_openai_extra_body(...).
         if video_kwargs is None:
             video_kwargs = {}
 
