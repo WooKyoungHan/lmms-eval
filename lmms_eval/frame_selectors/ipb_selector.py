@@ -760,6 +760,55 @@ def _motion_vectors_side_data(frame: Any):
     return None
 
 
+def _pixel_diff_motion_masses_lmms(video_path: str) -> List[float]:
+    """Compute per-frame motion proxy from decoded pixel differences.
+
+    Fallback for codecs where EXPORT_MVS returns no data (HEVC, VP9, AV1, …).
+    Decodes to grayscale and computes sum(|frame[i] - frame[i-1]|).
+    """
+    if av is None:
+        raise RuntimeError("PyAV is required for pixel-diff motion fallback.")
+
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+
+    try:
+        w = stream.width or 640
+        h = stream.height or 480
+        stride = max(1, max(w, h) // 320)
+
+        prev_gray: Optional[np.ndarray] = None
+        results: List[float] = []
+
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                try:
+                    arr = frame.to_ndarray(format="gray")
+                except Exception:
+                    results.append(0.0)
+                    prev_gray = None
+                    continue
+
+                if stride > 1:
+                    arr = arr[::stride, ::stride]
+
+                if prev_gray is None:
+                    results.append(0.0)
+                else:
+                    if arr.shape == prev_gray.shape:
+                        diff = np.abs(
+                            arr.astype(np.float32) - prev_gray.astype(np.float32)
+                        )
+                        results.append(float(diff.sum()))
+                    else:
+                        results.append(0.0)
+                prev_gray = arr
+    finally:
+        container.close()
+
+    return results
+
+
 def _extract_frame_motion_masses_pyav(video_path: str, *, use_cache: bool = True) -> List[float]:
     cache_file = _meta_cache_path_with_suffix(video_path, "motion_mass")
     if use_cache and cache_file.exists():
@@ -814,6 +863,13 @@ def _extract_frame_motion_masses_pyav(video_path: str, *, use_cache: bool = True
             out.append(_frame_motion_mass_from_rows(rows))
 
     container.close()
+
+    # ---- fallback: pixel-diff when EXPORT_MVS produced all zeros ----
+    if out and all(v == 0.0 for v in out):
+        try:
+            out = _pixel_diff_motion_masses_lmms(video_path)
+        except Exception:
+            pass
 
     if use_cache and out:
         try:

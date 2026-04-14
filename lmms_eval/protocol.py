@@ -528,6 +528,17 @@ class ChatMessages(BaseModel):
             "frames_indices",
             "frame_recovery",
             "return_selector_debug",
+            # IPB selector controls (per-request override)
+            "ipb_refine_mode",
+            "r_ipb",
+            "c_min_dist",
+            # v13 density parameters
+            "v13_alpha",
+            "v13_beta",
+            "v13_sigma_sec",
+            "v13_sigma_adaptive",
+            # v14 ULR: per-request question text for text→r routing
+            "ulr_question",
         }
 
         runtime_video_kwargs = {

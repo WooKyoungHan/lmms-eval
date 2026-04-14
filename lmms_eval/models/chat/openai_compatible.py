@@ -27,6 +27,66 @@ load_dotenv(verbose=True)
 class OpenAICompatible(OpenAICompatibleSimple):
     is_simple = False
 
+    def __init__(self, *args, media_io_kwargs=None, **kwargs):
+        # Strip keys that may be passed as JSON strings via model_args
+        # so they don't reach OpenAICompatibleSimple.__init__ which only
+        # accepts a subset.
+        kwargs.pop("limit_mm_per_prompt", None)
+        super().__init__(*args, **kwargs)
+
+        # media_io_kwargs can come in as dict or JSON string (from CLI args)
+        if isinstance(media_io_kwargs, str):
+            import json as _json
+            try:
+                media_io_kwargs = _json.loads(media_io_kwargs)
+            except Exception:
+                media_io_kwargs = None
+        self.media_io_kwargs = media_io_kwargs or None
+
+    def _build_extra_body(self, per_request_video_kwargs=None):
+        """Build extra_body for vLLM per-request overrides.
+
+        Uses ChatMessages.build_openai_extra_body() which handles the
+        whitelist-based kwarg filtering. If ``per_request_video_kwargs`` is
+        given, it overlays on top of the static ``self.media_io_kwargs``
+        (used e.g. for injecting the ULR question text per request).
+        """
+        base = (self.media_io_kwargs or {}).get("video") or {}
+        video_kwargs = dict(base)
+        if per_request_video_kwargs:
+            video_kwargs.update(per_request_video_kwargs)
+        if not video_kwargs:
+            return None
+        try:
+            extra = ChatMessages.build_openai_extra_body(
+                video_kwargs=video_kwargs,
+                include_default_limit=True,
+            )
+        except Exception:
+            extra = None
+        return extra or None
+
+    @staticmethod
+    def _extract_question_text(chat_messages) -> str:
+        """Pull the last user text turn from a ChatMessages instance.
+
+        Used by v14 ULR to inject the question into per-request
+        ``ulr_question`` so the vLLM-side selector can route r_ipb.
+        """
+        try:
+            for message in reversed(chat_messages.messages):
+                if getattr(message, "role", None) != "user":
+                    continue
+                texts = [
+                    c.text for c in message.content
+                    if getattr(c, "type", None) == "text" and getattr(c, "text", None)
+                ]
+                if texts:
+                    return " ".join(texts).strip()
+        except Exception:
+            pass
+        return ""
+
     def generate_until(self, requests) -> List[str]:
         res = []
 
@@ -84,6 +144,23 @@ class OpenAICompatible(OpenAICompatibleSimple):
                     # payload["reasoning_effort"] = "medium"
                     payload["response_format"] = {"type": "text"}
                     payload["max_completion_tokens"] = 5000
+
+                per_req_video = {}
+                refine_mode = str(
+                    ((self.media_io_kwargs or {}).get("video") or {}).get(
+                        "ipb_refine_mode", ""
+                    )
+                ).lower()
+                if refine_mode in ("v14", "v14_1", "v14_2", "v14_3", "v14_4",
+                                    "v15_1", "v15_2", "v15_3", "v16",
+                                    "v20_on", "v22_on", "v23_on", "v26_on"):
+                    q_text = self._extract_question_text(chat_messages)
+                    if q_text:
+                        per_req_video["ulr_question"] = q_text
+
+                extra_body = self._build_extra_body(per_request_video_kwargs=per_req_video or None)
+                if extra_body:
+                    payload["extra_body"] = extra_body
 
                 batch_payloads.append(payload)
                 batch_responses.append(None)
