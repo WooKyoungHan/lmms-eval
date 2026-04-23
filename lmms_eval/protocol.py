@@ -532,13 +532,66 @@ class ChatMessages(BaseModel):
             "ipb_refine_mode",
             "r_ipb",
             "c_min_dist",
+            # oracle_v2 / oracle_v3 (anchor-replacement oracle builders)
+            "discount_type",
+            "lam",
+            "gamma",
+            "min_gap_sec",
+            "eta_max_gap",
             # v13 density parameters
             "v13_alpha",
             "v13_beta",
             "v13_sigma_sec",
             "v13_sigma_adaptive",
+            # v37 density parameters (promotion of v13)
+            "v37_alpha",
+            "v37_beta",
+            "v37_sigma_sec",
+            "v37_sigma_adaptive",
+            # v38: v37 + GOP duration-drop pre-filtering
+            "v38_alpha",
+            "v38_beta",
+            "v38_sigma_sec",
+            "v38_sigma_adaptive",
+            "v38_min_gop_sec",
             # v14 ULR: per-request question text for text→r routing
             "ulr_question",
+            # v5 focus-context parameters
+            "v5_n_seg",
+            "v5_n_focus",
+            "v5_seg_width_mult",
+            "v5_n_best",
+            "v5_n_worst",
+            # v6 residual-surprise parameters
+            "v6_n_seg",
+            "v6_n_worst",
+            "v6_n_focus",
+            "v6_alpha",
+            "v6_seg_width_mult",
+            # v40 parameters
+            "mcv_threshold",
+            # v72 parameters
+            "v72_quantile",
+            "v72_min_seg_bins",
+            "v72_gap_merge_bins",
+            "v72_kappa",
+            "v72_density_mult",
+            "v72_gamma",
+            "v72_max_peaks",
+            "v72_kappa_amp",
+            "v72_kappa_tau",
+            "v72_kappa_base",
+            "v82_max_depth",
+            "v82_t1",
+            "v82_lam",
+            "v82_n_bins",
+            "v91_sub_mult",
+            "v91_ref_K_coarse",
+            "v91_ref_K_fine",
+            "v91_q_fine_offset",
+            # generic per-request overrides
+            "ot_lam",
+            "coverage_c",
         }
 
         runtime_video_kwargs = {

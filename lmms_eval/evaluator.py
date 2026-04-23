@@ -95,14 +95,37 @@ def _stratified_pick_indices(docs, limit, bucket_field="duration", counts=None, 
         f"[VideoMME stratified limit] bucket_sizes={ {k: len(v) for k, v in idx_by_bucket.items()} }"
     )
 
+    import random
+    from collections import defaultdict
+    rng = random.Random(seed)
+
+    # Group indices by (bucket, videoID) to keep all questions from same video together
+    vid_groups_by_bucket = {b: defaultdict(list) for b in buckets}
+    for b in buckets:
+        for i in idx_by_bucket[b]:
+            vid = None
+            if isinstance(docs[i], dict):
+                vid = docs[i].get("videoID", docs[i].get("video_id"))
+            if vid is None:
+                vid = f"__doc_{i}"  # fallback: treat each doc as its own group
+            vid_groups_by_bucket[b][vid].append(i)
+
     chosen = []
     for b in buckets:
-        ids = idx_by_bucket[b]
-        chosen.extend(ids[: min(counts.get(b, 0), len(ids))])
+        target = counts.get(b, 0)
+        groups = list(vid_groups_by_bucket[b].values())
+        rng.shuffle(groups)
+        n = 0
+        for g in groups:
+            if n >= target:
+                break
+            chosen.extend(g)
+            n += len(g)
 
     if len(chosen) < limit:
         chosen_set = set(chosen)
         rest = [i for i in range(len(docs)) if i not in chosen_set]
+        rng.shuffle(rest)
         chosen.extend(rest[: (limit - len(chosen))])
 
     return chosen[:limit]

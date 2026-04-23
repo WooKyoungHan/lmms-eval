@@ -1,7 +1,40 @@
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
+
+
+# ----------------------------------------------------------------------
+# ULR question-stem extraction helper
+# ----------------------------------------------------------------------
+_MCQ_CHOICE_RE = re.compile(
+    r"\n\s*(?:[A-Da-d][\.\)]|\([A-Da-d]\)|[1-4][\.\)])\s+",
+)
+_ANSWER_INSTRUCTION_RE = re.compile(
+    r"\b(?:answer with the (?:option'?s? )?letter|please answer "
+    r"(?:with )?the correct option|choose (?:one|the correct)|"
+    r"select the (?:correct|right) (?:answer|option))\b[^\n]*",
+    re.IGNORECASE,
+)
+
+
+def _strip_to_question_stem(text: str) -> str:
+    """Strip MCQ choices and trailing answer instruction.
+    Keep only the question stem (matches offline parquet `question` field).
+    Fallback: if no choice marker found, return trimmed full text.
+    """
+    if not text:
+        return ""
+    # Cut at first MCQ choice marker
+    m = _MCQ_CHOICE_RE.search(text)
+    if m:
+        text = text[: m.start()].rstrip()
+    # Drop trailing "Answer with ..." instruction if still present
+    text = _ANSWER_INSTRUCTION_RE.sub("", text).strip()
+    # Also drop any trailing "Question:" / "Q:" prefix that some tasks add
+    text = re.sub(r"^\s*(?:Question|Q)\s*[:\-]\s*", "", text, flags=re.IGNORECASE)
+    return text.strip()
 
 from tqdm import tqdm
 
@@ -66,12 +99,26 @@ class OpenAICompatible(OpenAICompatibleSimple):
             extra = None
         return extra or None
 
+    # ---- helpers ----
+    @staticmethod
+    def _strip_question_stem(text: str) -> str:
+        """Strip MCQ choices and final instruction.  Kept for testing/reuse."""
+        return _strip_to_question_stem(text)
+
     @staticmethod
     def _extract_question_text(chat_messages) -> str:
-        """Pull the last user text turn from a ChatMessages instance.
+        """Pull the last user text turn, stripped to question stem only.
 
-        Used by v14 ULR to inject the question into per-request
+        Used by ULR (v14+) to inject the question into per-request
         ``ulr_question`` so the vLLM-side selector can route r_ipb.
+
+        IMPORTANT: multiple-choice prompts contain "A. ... B. ... C. ... D. ..."
+        choices after the question stem.  Those choices add noise to axis
+        similarity scoring (e.g., the word "subtitle" or digits in answer text
+        falsely activate OCR / count axes).  Offline ULR eval uses only the
+        question stem (from parquet `question` field), so we must do the same
+        here: strip everything from the first "A." / "a)" / "1." marker and
+        drop the trailing "Answer with the option's letter ..." instruction.
         """
         try:
             for message in reversed(chat_messages.messages):
@@ -81,8 +128,10 @@ class OpenAICompatible(OpenAICompatibleSimple):
                     c.text for c in message.content
                     if getattr(c, "type", None) == "text" and getattr(c, "text", None)
                 ]
-                if texts:
-                    return " ".join(texts).strip()
+                if not texts:
+                    continue
+                full = " ".join(texts).strip()
+                return _strip_to_question_stem(full)
         except Exception:
             pass
         return ""
@@ -153,7 +202,9 @@ class OpenAICompatible(OpenAICompatibleSimple):
                 ).lower()
                 if refine_mode in ("v14", "v14_1", "v14_2", "v14_3", "v14_4",
                                     "v15_1", "v15_2", "v15_3", "v16",
-                                    "v20_on", "v22_on", "v23_on", "v26_on"):
+                                    "v20_on", "v22_on", "v23_on", "v26_on",
+                                    "v31", "v35_on",
+                                    "v36_1", "v36_2_on", "v36_3"):
                     q_text = self._extract_question_text(chat_messages)
                     if q_text:
                         per_req_video["ulr_question"] = q_text
