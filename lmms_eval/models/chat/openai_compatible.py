@@ -1,8 +1,30 @@
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
+
+
+def _video_id_from_doc_path(path) -> str:
+    """Extract video_id from a doc field that holds a video filename.
+
+    Mirrors BOLT's `utils/mvbench_utils.py::_lmmseval_key`:
+        os.path.basename(path).split('.')[0]
+    i.e., truncate at the FIRST dot rather than `os.path.splitext` (which
+    strips only the last extension). This matters for MVBench subtasks
+    whose filenames embed timestamps —
+        "ZS9XR_1.5_17.1.mp4".split('.')[0] == "ZS9XR_1"
+    matches the JSON's video_id key, while os.path.splitext would yield
+    "ZS9XR_1.5_17.1" which is not a JSON key.
+
+    Backwards-compatible for the other benchmarks:
+        "86CxyhFV9MI.mp4".split('.')[0] == "86CxyhFV9MI"          # LVB
+        "0074f737-...-77c3a8127391.mp4".split('.')[0] == same     # EgoSchema
+    """
+    if not path or not isinstance(path, str):
+        return ""
+    return os.path.basename(path).split(".")[0]
 
 
 # ----------------------------------------------------------------------
@@ -195,11 +217,9 @@ class OpenAICompatible(OpenAICompatibleSimple):
                     payload["max_completion_tokens"] = 5000
 
                 per_req_video = {}
-                refine_mode = str(
-                    ((self.media_io_kwargs or {}).get("video") or {}).get(
-                        "ipb_refine_mode", ""
-                    )
-                ).lower()
+                video_kwargs_static = (self.media_io_kwargs or {}).get("video") or {}
+                refine_mode = str(video_kwargs_static.get("ipb_refine_mode", "")).lower()
+                video_backend = str(video_kwargs_static.get("video_backend", "")).lower()
                 if refine_mode in ("v14", "v14_1", "v14_2", "v14_3", "v14_4",
                                     "v15_1", "v15_2", "v15_3", "v16",
                                     "v20_on", "v22_on", "v23_on", "v26_on",
@@ -208,6 +228,49 @@ class OpenAICompatible(OpenAICompatibleSimple):
                     q_text = self._extract_question_text(chat_messages)
                     if q_text:
                         per_req_video["ulr_question"] = q_text
+
+                # keyframe_json backend: inject (video_id, question_id) from
+                # the doc so the vLLM-side backend can look up pre-computed
+                # keyframes. Field names vary per task — try the union of
+                # observed conventions:
+                #   video_id  : video_id / videoID (videomme) / video_idx
+                #               (egoschema) / video / video_path basename
+                #   qid       : id (lvb) / question_id (videomme) / q_uid
+                #               (egoschema) / qid
+                if video_backend == "keyframe_json":
+                    try:
+                        doc = self.task_dict[task][split][doc_id]
+                    except Exception:
+                        doc = {}
+                    if isinstance(doc, dict):
+                        vid = (
+                            doc.get("video_id")
+                            or doc.get("videoID")
+                            or doc.get("video_idx")
+                            or _video_id_from_doc_path(doc.get("video_path"))
+                            or _video_id_from_doc_path(doc.get("video"))
+                        )
+                        qid = (
+                            doc.get("id")
+                            or doc.get("question_id")
+                            or doc.get("q_uid")
+                            or doc.get("qid")
+                        )
+                        # MVBench rows have no unique id field at all
+                        # (cols: video/question/candidates/answer). The JSON
+                        # qid is `<subtask>_<row_idx>`; subtask comes from the
+                        # task name (mvbench_<subtask>), row_idx == doc_id.
+                        if not qid and isinstance(task, str) and task.startswith("mvbench_"):
+                            qid = f"{task[len('mvbench_'):]}_{doc_id}"
+                        if vid:
+                            per_req_video["video_id"] = str(vid)
+                        if qid is not None:
+                            per_req_video["keyframe_question_id"] = str(qid)
+                    # Always include question text as a fuzzy-match fallback.
+                    if "ulr_question" not in per_req_video:
+                        q_text = self._extract_question_text(chat_messages)
+                        if q_text:
+                            per_req_video["ulr_question"] = q_text
 
                 extra_body = self._build_extra_body(per_request_video_kwargs=per_req_video or None)
                 if extra_body:

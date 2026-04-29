@@ -1,14 +1,52 @@
+"""LEGACY client-side codec patchification.
+
+**Deprecated as of 2026-04-23** — the OneVision-Encoder "Codec Patchification"
+algorithm (arXiv 2602.08683) has been ported to the vLLM server side at
+`third_party/vllm/vllm/multimodal/frame_selectors/codec_patch_mask.py`.
+That module runs inside the vLLM decode hook and produces a per-frame
+bool mask over the ViT patch grid which the model forward path consumes
+via a gather/scatter around the SigLIP/CLIP encoder (token-level drop,
+not just coordinate reporting).
+
+This file is retained because the in-process Qwen3-VL HF model path still
+reads `LMMS_CODEC_PATCHIFY` / `LMMS_CODEC_PATCH_*` env vars via
+`lmms_eval/models/simple/qwen3_vl.py`. When the server-side path is
+active, do not also enable this one — the two will double-mask.
+
+New code should import from vllm:
+
+    from vllm.multimodal.frame_selectors.codec_patch_mask import (
+        CodecMaskConfig, compute_codec_patch_mask,
+    )
+
+Any edits to the scoring formula (percentile normalization, MV+residual
+fuse, top-k selection) should land in the vLLM-side module so training
+and serving stay aligned; mirror them here only if you still depend on
+the HF path.
+"""
 from __future__ import annotations
 
 import json
 import math
 import os
 import subprocess
+import warnings
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
+
+warnings.warn(
+    "lmms_eval.frame_selectors.patch_selector is legacy; the active "
+    "implementation now lives in "
+    "vllm.multimodal.frame_selectors.codec_patch_mask "
+    "(OneVision-Encoder arXiv 2602.08683). Import this module only if "
+    "you're on the in-process Qwen3-VL HF path.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 try:
     import cv_reader.api as cv_api  # type: ignore

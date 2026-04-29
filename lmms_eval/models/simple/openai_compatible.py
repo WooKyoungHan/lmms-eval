@@ -94,14 +94,28 @@ class OpenAICompatible(lmms):
         if base_url and base_url.endswith("/"):
             base_url = base_url.rstrip("/")
 
+        # Per-request HTTP timeout for the OpenAI SDK. Default 600 s
+        # is too short for video-VLM eval where server-side decode of
+        # long videos can take several minutes per request; bump to
+        # 1 h. Override via LMMS_OPENAI_REQUEST_TIMEOUT env if needed.
+        request_timeout = float(
+            os.environ.get("LMMS_OPENAI_REQUEST_TIMEOUT", "3600")
+        )
+
         self.client = (
-            OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+            OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                http_client=http_client,
+                timeout=request_timeout,
+            )
             if not azure_openai
             else AzureOpenAI(
                 api_key=os.getenv("AZURE_OPENAI_API_KEY"),
                 azure_endpoint=os.getenv("AZURE_OPENAI_API_BASE"),
                 api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
                 http_client=http_client,
+                timeout=request_timeout,
             )
         )
 

@@ -522,6 +522,7 @@ class ChatMessages(BaseModel):
             "video_backend",
             "num_frames",
             "budget_frames",
+            "budget_fps",
             "fps",
             "max_duration",
             "frame_indices",
@@ -581,6 +582,8 @@ class ChatMessages(BaseModel):
             "v72_kappa_amp",
             "v72_kappa_tau",
             "v72_kappa_base",
+            "v72_bin_ref_sec",
+            "v72_bin_c",
             "v82_max_depth",
             "v82_t1",
             "v82_lam",
@@ -592,6 +595,17 @@ class ChatMessages(BaseModel):
             # generic per-request overrides
             "ot_lam",
             "coverage_c",
+            # codec-driven per-patch mask (opt-in; default OFF)
+            "codec_mask_mode",
+            "codec_mask_keep_ratio",
+            "codec_mask_iframe_full",
+            "codec_mask_score",
+            "codec_mask_patch_size",
+            "codec_mask_budget_path",
+            "codec_mask_drop_stage",
+            # keyframe_json backend (pre-computed per-(video,question) keyframes)
+            "video_id",
+            "keyframe_question_id",
         }
 
         runtime_video_kwargs = {

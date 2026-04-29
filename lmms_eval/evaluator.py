@@ -781,6 +781,64 @@ def evaluate(
                 offset=iter_offset,
             )
             total_docs = len(instances_by_doc_id)
+
+            # Dump raw model responses BEFORE process_results runs.
+            # Safety net for tasks with slow / fragile post-processing
+            # (e.g. activitynetqa's GPT-4o judge): if the judge phase fails
+            # or is rate-limited mid-run, raw model predictions are still
+            # preserved on disk and can be re-judged offline.
+            # Output path: $LMMS_RAW_RESPS_DIR or cli_args.output_path.
+            # Skip with LMMS_DUMP_RAW_RESPS=0.
+            if RANK == 0 and os.environ.get("LMMS_DUMP_RAW_RESPS", "1") != "0":
+                _raw_dir = os.environ.get("LMMS_RAW_RESPS_DIR")
+                if not _raw_dir and cli_args is not None:
+                    _raw_dir = getattr(cli_args, "output_path", None)
+                if _raw_dir:
+                    try:
+                        os.makedirs(_raw_dir, exist_ok=True)
+                        _raw_path = os.path.join(
+                            _raw_dir,
+                            f"raw_resps_{task.task_name}_{filter_key}.jsonl",
+                        )
+                        with open(_raw_path, "w") as _rf:
+                            for _did, _reqs in instances_by_doc_id.items():
+                                _doc_obj = (
+                                    _reqs[0].doc
+                                    if _reqs and getattr(_reqs[0], "doc", None)
+                                    else {}
+                                )
+                                # Drop multimodal/non-serializable fields (PIL
+                                # images, video tensors); keep everything else
+                                # via handle_non_serializable for numpy scalars.
+                                _doc_serial = {}
+                                if isinstance(_doc_obj, dict):
+                                    for _k, _v in _doc_obj.items():
+                                        if not is_multimodal_content(_v):
+                                            _doc_serial[_k] = _v
+                                _rec = {
+                                    "doc_id": _did,
+                                    "doc": _doc_serial,
+                                    "target": task.doc_to_target(_doc_obj)
+                                    if isinstance(_doc_obj, dict)
+                                    else None,
+                                    "resps": [r.resps for r in _reqs],
+                                    "filtered_resps": [
+                                        r.filtered_resps[filter_key] for r in _reqs
+                                    ],
+                                }
+                                _rf.write(
+                                    json.dumps(
+                                        _rec,
+                                        default=handle_non_serializable,
+                                        ensure_ascii=False,
+                                    ) + "\n"
+                                )
+                        eval_logger.info(
+                            f"[raw_resps] wrote {total_docs} entries to {_raw_path}"
+                        )
+                    except Exception as _e:
+                        eval_logger.warning(f"[raw_resps] dump failed: {_e}")
+
             pbar = tqdm(total=total_docs, desc="Postprocessing", disable=(RANK != 0))
             # pbar = tqdm(total=total_docs, desc="Postprocessing", disable=(RANK != 0))
             for doc_id, doc in doc_iterator:
