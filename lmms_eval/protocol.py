@@ -603,6 +603,37 @@ class ChatMessages(BaseModel):
             "codec_mask_patch_size",
             "codec_mask_budget_path",
             "codec_mask_drop_stage",
+            # v_h2f (hierarchical coarse-to-fine) per-request knobs
+            "f_long_trigger_sec",
+            "f_min_coarse_seg_sec",
+            "f_fine_ref",
+            "f_fine_quantile",
+            "f_sub_mass_exp",
+            # v_motion (G) per-request knobs
+            "g_motion_weight_exp",
+            "g_density_mix",
+            "g_norm",
+            # v_deriv (L) per-request knobs
+            "l_deriv_weight",
+            "l_smooth_sigma",
+            "l_deriv_blend",
+            # v_uniform_aug (K) per-request knobs
+            "k_uniform_frac",
+            "k_offset",
+            # v_band_argmax (Q) per-request knob
+            "q_band_mode",
+            # v_cdf (S) per-request knobs
+            "s_density_power",
+            "s_smooth_sigma",
+            # v72_density_mult per-request override (for control sweeps)
+            "v72_density_mult",
+            # v_anchor_cdf (U) per-request knobs
+            "u_anchor_frac",
+            "u_density_power",
+            "u_smooth_sigma",
+            # v_peak (W) per-request knobs
+            "w_min_gap_frac",
+            "w_local_radius_frac",
             # keyframe_json backend (pre-computed per-(video,question) keyframes)
             "video_id",
             "keyframe_question_id",
