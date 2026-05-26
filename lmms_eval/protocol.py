@@ -634,6 +634,20 @@ class ChatMessages(BaseModel):
             # v_peak (W) per-request knobs
             "w_min_gap_frac",
             "w_local_radius_frac",
+            # v_c2f (coarse-to-fine) per-request knobs
+            "c2f_boundary_lambda",
+            "c2f_min_gap_sec",
+            "c2f_scales",
+            # v_c2f2 (Phase B: importance-weighted allocation) per-request knobs
+            "c2f2_alpha_min",
+            "c2f2_lambda_b",
+            "c2f2_lambda_u",
+            "c2f2_k_min",
+            # v_shotdedup (SD) per-request knobs
+            "sd_base_fps",
+            "sd_u_mode",
+            "sd_shot_threshold",
+            "sd_hist_type",
             # keyframe_json backend (pre-computed per-(video,question) keyframes)
             "video_id",
             "keyframe_question_id",
