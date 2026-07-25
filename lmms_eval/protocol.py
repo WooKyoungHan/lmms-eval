@@ -573,6 +573,7 @@ class ChatMessages(BaseModel):
             "mcv_threshold",
             # v72 parameters
             "v72_quantile",
+            "v72_beta",
             "v72_min_seg_bins",
             "v72_gap_merge_bins",
             "v72_kappa",
